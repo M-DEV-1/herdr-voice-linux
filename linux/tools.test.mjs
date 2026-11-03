@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { ConfirmGate, agentName, condense, createTools, focusTargets, resolveFocus, untrusted } from "./tools.mjs";
+import { ConfirmGate, agentName, condense, createTools, describeState, herdrState, resolveTarget, untrusted } from "./tools.mjs";
 
 // herdr-voice runs in pane wA:pV, tab wA:tV, workspace wA, with spoken confirmation on (HERDR_VOICE_CONFIRM=1) unless a test turns it off. Workspace wB "forge" holds an agent pane and a dev server pane.
 const ENV = { HERDR_ENV: "1", HERDR_PANE_ID: "wA:pV", HERDR_TAB_ID: "wA:tV", HERDR_WORKSPACE_ID: "wA", HERDR_VOICE_CONFIRM: "1" };
@@ -205,15 +205,80 @@ test("read-only tools trim herdr's JSON for the model", async () => {
   assert.equal(JSON.parse((await tools.run("list_worktrees", { workspace: "forge" })).output)[1].open_as, "wB");
 });
 
-test("names resolve exactly before loosely, and ambiguity goes back to the model", () => {
-  const targets = focusTargets(SNAPSHOT);
-  assert.equal(resolveFocus("FORGE", targets).hit.id, "wB");
-  assert.equal(resolveFocus("claude-forge", targets).hit.kind, "agent");
-  assert.equal(resolveFocus("scr", targets).hit.id, "wB:t2");
-  assert.match(resolveFocus("", targets).fail, /^error: say which/);
-  const twins = [{ kind: "workspace", id: "w1", label: "work-a" }, { kind: "workspace", id: "w2", label: "work-b" }];
-  assert.equal(resolveFocus("work", twins).fail, "ambiguous workspace: work-a (w1), work-b (w2); ask which one");
-  assert.match(resolveFocus("zzz", targets).fail, /known: claude-forge, voice, forge/);
+// A random Herdr layout from a fixed seed: two or three workspaces with two-word names, two or three single-word tabs each, one or two panes per tab, some of them named. Every name word is used once.
+const WORDS = ["orders", "inbox", "portal", "docs", "build", "api", "billing", "deploy", "server", "review", "search", "payments", "staging", "metrics", "release", "mobile", "invoices", "gateway"];
+function layout(seed) {
+  let x = seed;
+  const rand = (n) => { x = (x * 1103515245 + 12345) % 2147483648; return x % n; };
+  const pool = [...WORDS];
+  const take = () => pool.splice(rand(pool.length), 1)[0];
+  const snap = { workspaces: [], tabs: [], panes: [], layouts: [] };
+  for (let w = 1; w <= 2 + rand(2); w++) {
+    const ws = `w${w}`;
+    snap.workspaces.push({ workspace_id: ws, label: `${take()} ${take()}`, number: w, active_tab_id: `${ws}:t1` });
+    for (let t = 1; t <= 2 + rand(2); t++) {
+      const tab = `${ws}:t${t}`;
+      snap.tabs.push({ tab_id: tab, workspace_id: ws, label: take(), number: t });
+      for (let p = 1; p <= 1 + rand(2); p++) snap.panes.push({ pane_id: `${tab}p${p}`, tab_id: tab, workspace_id: ws, terminal_title_stripped: "bash", ...(rand(3) === 0 ? { label: `${take()} ${take()}` } : {}) });
+      snap.layouts.push({ tab_id: tab, focused_pane_id: `${tab}p1` });
+    }
+  }
+  const focus = snap.panes[rand(snap.panes.length)];
+  Object.assign(snap, { focused_pane_id: focus.pane_id, focused_tab_id: focus.tab_id, focused_workspace_id: focus.workspace_id });
+  return JSON.stringify({ result: { snapshot: snap } });
+}
+// The ways a name gets said aloud: as is, with filler and kind words, in capitals, with punctuation, misheard by a letter, or cut short.
+const SAID = [
+  (n) => n, (n, k) => `the ${n} ${k}`, (n) => n.toUpperCase(), (n) => `${n} ticket`, (n) => `the ${n} tickets`,
+  (n) => n.replaceAll(" ", "-"), (n) => `${n}!`, (n) => n.split(" ").map((w) => (w.length > 5 ? w.slice(0, -1) : w)).join(" "),
+  (n) => n.split(" ").map((w) => w.slice(0, 4)).join(" "),
+];
+
+test("every workspace, tab and named pane is found from any spoken form of its name", () => {
+  for (let seed = 1; seed <= 40; seed++) {
+    const state = herdrState(layout(seed), "none");
+    for (const t of state.targets.filter((x) => x.kind !== "pane" || x.names.length > 1)) {
+      for (const say of SAID) {
+        const said = say(t.label, t.kind);
+        assert.equal(resolveTarget(said, state).hit?.id, t.id, `seed ${seed}: "${said}"`);
+        assert.equal(resolveTarget(said, state, { pane: true }).hit?.id, t.lands, `seed ${seed}: "${said}" as a pane`);
+      }
+    }
+    assert.match(resolveTarget("zebra crossing", state).fail, /^error: nothing named zebra crossing; there are: /);
+  }
+});
+
+test('"this" means the focused workspace, tab or pane, and never the voice\'s own pane', () => {
+  for (let seed = 1; seed <= 20; seed++) {
+    const snap = layout(seed);
+    const state = herdrState(snap, "none");
+    for (const said of ["this", "this pane", "the current pane", "here", "the focused one"]) assert.equal(resolveTarget(said, state, { pane: true }).hit.id, state.focused.pane, said);
+    assert.equal(resolveTarget("this tab", state, { kinds: ["tab"] }).hit.id, state.focused.tab);
+    assert.equal(resolveTarget("this workspace", state, { kinds: ["workspace"] }).hit.id, state.focused.workspace);
+    assert.match(resolveTarget("this pane", herdrState(snap, state.focused.pane), { pane: true }).fail, /herdr-voice itself/);
+  }
+  assert.match(resolveTarget("", herdrState(layout(1), "none")).fail, /^error: say which/);
+});
+
+test("the same name in several places prefers the kind said, then the focused workspace, and otherwise lists the candidates", () => {
+  const snap = (focusedWs) => JSON.stringify({ result: { snapshot: {
+    focused_workspace_id: focusedWs,
+    workspaces: [{ workspace_id: "w1", label: "api" }, { workspace_id: "w2", label: "web" }, { workspace_id: "w3", label: "ops" }],
+    tabs: [{ tab_id: "w1:t1", workspace_id: "w1", label: "logs" }, { tab_id: "w2:t1", workspace_id: "w2", label: "logs" }, { tab_id: "w3:t1", workspace_id: "w3", label: "api" }],
+    panes: [{ pane_id: "w1:p1", tab_id: "w1:t1", workspace_id: "w1" }, { pane_id: "w2:p1", tab_id: "w2:t1", workspace_id: "w2" }, { pane_id: "w3:p1", tab_id: "w3:t1", workspace_id: "w3" }],
+  } } });
+  assert.equal(resolveTarget("logs", herdrState(snap("w2"))).hit.id, "w2:t1");
+  assert.equal(resolveTarget("the api workspace", herdrState(snap("w2"))).hit.id, "w1");
+  assert.equal(resolveTarget("api tab", herdrState(snap("w2"))).hit.id, "w3:t1");
+  assert.match(resolveTarget("logs", herdrState(snap("w3"))).fail, /^ambiguous: tab logs \(w1:t1\) in api, tab logs \(w2:t1\) in web/);
+});
+
+test("the model's picture of Herdr lists names and IDs, marks focus and the voice pane, and is fenced", () => {
+  const text = describeState(herdrState(SNAPSHOT, "wA:pV"));
+  assert.match(text, /^\[state\] /);
+  assert.match(text, /workspace "voice" \[wA\] \(focused\)\n {2}tab "voice" \[wA:tV\]: pane "herdr-voice" \[wA:pV\] herdr-voice itself \(focused\)/);
+  assert.match(text, /pane "claude-forge" \[wB:p1\] agent claude-forge idle; pane "npm run dev" \[wB:p2\]/);
+  assert.match(text, /<<<UNTRUSTED TERMINAL OUTPUT/);
 });
 
 test("create tools run at once and report the new IDs; from a report they ask first", async () => {

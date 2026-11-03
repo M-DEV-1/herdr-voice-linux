@@ -69,6 +69,17 @@ An action the model takes on its own right after an agent report, with nothing s
 `HERDR_VOICE_CONFIRM=1` brings back the spoken yes before every risky action.
 `HERDR_VOICE_ONLY_WORKSPACE=<workspace id>` is for testing: the voice refuses anything that names a workspace, tab, pane or agent outside that workspace, and refuses to create workspaces.
 
+**Names and "this"**
+
+The voice is sent a short list of every workspace, tab and pane, with names, IDs and what is focused, when a session starts and again whenever Herdr reports a change on its event socket.
+Tools match spoken names without regard to case, punctuation, filler words ("the", "pane", "tab", "workspace", "ticket"), one wrong letter or a cut-short word, and prefer the focused workspace when a name appears in several places.
+"This pane", "this tab" and "this workspace" mean the focused one; the voice's own pane is never read or closed this way.
+
+**Testing with typed turns**
+
+`herdr-voice --script FILE` sends each line of FILE to the real Gemini Live session as a typed turn, waits for its tool calls and reply, and prints them; no audio plays.
+Run it with `HERDR_VOICE_ONLY_WORKSPACE=<workspace id>` on the command line so it can only act on a test workspace.
+
 **Models**
 
 The default model is `gemini-3.1-flash-live-preview`.
