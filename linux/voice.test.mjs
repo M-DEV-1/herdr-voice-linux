@@ -375,3 +375,62 @@ test('the microphone drops the first second of each pw-record run and restarts p
   assert.equal(chunks.length, 50);
   assert.ok(chunks.every((c) => c.every((b) => b === 2)));
 });
+
+const reply = (text) => ({ serverContent: { outputTranscription: { text } } });
+const turnDone = { serverContent: { turnComplete: true } };
+const texts = (sent) => sent.filter((m) => m.clientContent).map((m) => [m.clientContent.turns[0].parts[0].text, m.clientContent.turnComplete]);
+
+test('reports and the picture of Herdr wait while you talk, while a reply is awaited, made or spoken, then go out in that order', async () => {
+  const speaker = { isSpeaking: false, until: 0, interrupt() {}, level: () => 0 };
+  const { session, sent, feed } = liveSession({ speaker });
+  session.midTurn = true;
+  session.report('[herdr] Agent fixer finished.');
+  session.herdrState = '[state] one';
+  session.flushIdle();
+  assert.deepEqual(texts(sent), [], 'while you talk');
+  session.handle({ t: 'speechStopped' });
+  assert.deepEqual(texts(sent), [], 'while the reply is awaited');
+  feed(reply('Opened the build pane.'));
+  session.herdrState = '[state] two';
+  session.flushIdle();
+  assert.deepEqual(texts(sent), [], 'while the reply is made');
+  Object.assign(speaker, { isSpeaking: true, until: Date.now() + 200 });
+  feed(turnDone);
+  assert.deepEqual(texts(sent), [], 'while the voice speaks');
+  // The echo of the voice lasts half a second after it stops.
+  Object.assign(speaker, { isSpeaking: false, until: Date.now() - 600 });
+  await new Promise((r) => setTimeout(r, 300));
+  assert.deepEqual(texts(sent), [['[state] two', false], ['[herdr] Agent fixer finished.', true]]);
+  session.shutdown();
+});
+
+test('a reply ending on an offer, or reading an ID, is flagged; answers, mid-reply offers and pending confirmations are not', () => {
+  const answers = ['The build passed.', 'One ticket is fixed and two are open.', 'Closed the docs pane.', "Didn't catch that."];
+  const offers = ["Let me know if you'd like to proceed.", 'Want me to run it again?', 'Anything else?', 'Would you like me to open it?', 'Feel free to ask.', 'Do you want to see the logs?', "If you'd like, I can rerun it.", 'Shall I close it?'];
+  const said = (text, asking = false) => { const p = new SpeechPolicy(false, asking); p.feed(text); return p.endsWithOffer; };
+  for (const a of answers) {
+    assert.equal(said(a), false, a);
+    for (const o of offers) {
+      assert.equal(said(`${a} ${o}`), true, `${a} ${o}`);
+      assert.equal(said(`${o} ${a}`), false, `${o} ${a}`);
+      assert.equal(said(`${a} ${o}`, true), false, `asking: ${a} ${o}`);
+    }
+  }
+  assert.deepEqual(new SpeechPolicy().feed('Focused pane wK:p2.'), { leak: 'an ID' });
+  assert.equal(new SpeechPolicy().feed('Focused the linear pane in workspace two.'), null);
+});
+
+test('an offer at the end of a reply gets one [policy] note per turn of yours, sent after the reply without asking for another', () => {
+  const { session, sent, feed } = liveSession();
+  const offer = () => { feed(reply("Closed the pane. Let me know if you'd like to proceed.")); feed(turnDone); };
+  offer();
+  assert.deepEqual(texts(sent).map(([t, done]) => [t.split('.')[0], done]), [['[policy] Your last reply ended with an offer or a question about going on', false]]);
+  offer();
+  assert.equal(texts(sent).length, 1, 'once per turn');
+  session.handle({ t: 'user', text: 'open the docs pane' });
+  offer();
+  assert.equal(texts(sent).length, 2);
+  feed(reply('Opened the docs pane.'));
+  feed(turnDone);
+  assert.equal(texts(sent).length, 2);
+});
