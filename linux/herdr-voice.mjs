@@ -2,13 +2,13 @@
 // herdr-voice for Linux: talk to the coding agents in your Herdr panes through Gemini Live, from a Herdr pane.
 // This is the voice and session side of the macOS plugin. The tools the model can call live in tools.mjs.
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const PLUGIN_ID = 'brogrammermw.herdr-voice';
-const SELF = fileURLToPath(import.meta.url);
+const SELF = realpathSync(fileURLToPath(import.meta.url));
 const ENDPOINT = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 const DEFAULT_MODEL = 'gemini-3.1-flash-live-preview';
 const DEFAULT_VOICE = 'Kore';
@@ -17,6 +17,12 @@ const OUT_BYTES_PER_SECOND = 48000;
 const CHUNK_BYTES = IN_RATE * 2 / 50;
 const QUIET_CLOSE_MS = 180_000;
 const BARGE_IN_MS = 1500;
+const ECHO_TAIL_MS = 500;
+const GOAWAY_MARGIN_MS = 2000;
+const SHUTDOWN_CAP_MS = 1500;
+// The socket counts as dead when mic audio went out in the last AUDIO_WINDOW_MS and Gemini sent nothing for DEAD_AFTER_MS. Gemini sends transcription at least every 9.5 s while you talk (measured), so 20 s of silence cannot happen in normal talking.
+const AUDIO_WINDOW_MS = 30_000;
+const DEAD_AFTER_MS = 20_000;
 const KEY_FILE = join(homedir(), '.config', 'herdr-voice', 'gemini.key');
 const LOCK_FILE = join(process.env.XDG_RUNTIME_DIR || tmpdir(), 'herdr-voice.pid');
 
@@ -90,7 +96,7 @@ const CONFIG_TEMPLATE = `# herdr-voice settings. Uncomment a line to use it; res
 # HERDR_VOICE_GEMINI_MODEL=${DEFAULT_MODEL}
 # Voice: Kore, Puck, Charon, Aoede, Fenrir, ...
 # HERDR_VOICE_VOICE=${DEFAULT_VOICE}
-# PipeWire node names for the microphone and speaker (default: june_ec_source / june_ec_sink if present, else the defaults)
+# PipeWire node names for the microphone and speaker (default: june_ec_source / june_ec_sink, else a node made by PipeWire's echo-cancel module, else the defaults)
 # HERDR_VOICE_MIC=
 # HERDR_VOICE_SPEAKER=
 # Stream the microphone continuously instead of only when you speak
@@ -237,7 +243,7 @@ export const textMessage = (text, expectsReply) => ({ clientContent: { turns: [{
 export const toolResponseMessage = (outputs) => ({ toolResponse: { functionResponses: outputs.map((o) => ({ id: o.id, name: o.name, response: o.output })) } });
 
 // Turns Gemini's server messages into the events the session reacts to. One instance per connection, because it joins transcript pieces into whole utterances.
-// Events: audio, assistantDelta, assistant, user, speechStarted, speechStopped, responseCreated, responseDone, call, ending, handle, error, ignored.
+// Events: audio, assistantDelta, assistant, userPiece, user, speechStarted, speechStopped, responseCreated, responseDone, call, ending, handle, error, ignored.
 // Gemini has no speech started/stopped events, so the first piece of your transcript while the model is idle, or an interrupted flag, stands in for "you started talking".
 export class GeminiWire {
   modelTurnActive = false;
@@ -252,7 +258,7 @@ export class GeminiWire {
     if ('setupComplete' in msg) events.push({ t: 'ignored', what: 'setupComplete' });
     if (msg.serverContent) this.content(msg.serverContent, events);
     if (msg.toolCall) this.toolCall(msg.toolCall, events);
-    if ('goAway' in msg) events.push({ t: 'ending' });
+    if ('goAway' in msg) events.push({ t: 'ending', timeLeftMs: Number.parseFloat(msg.goAway?.timeLeft) * 1000 || 0 });
     const update = msg.sessionResumptionUpdate;
     if (update?.resumable && update.newHandle) events.push({ t: 'handle', handle: update.newHandle });
     if (msg.error) events.push({ t: 'error', message: msg.error.message ?? 'Gemini error' });
@@ -265,6 +271,7 @@ export class GeminiWire {
       // Late pieces that arrive after the model began answering still belong to the utterance, but are not a new start (that would count as barge-in).
       if (!this.userSpeaking && !this.modelTurnActive) { this.userSpeaking = true; events.push({ t: 'speechStarted' }); }
       this.userText += heard;
+      events.push({ t: 'userPiece', text: heard });
     }
     if (c.interrupted === true) {
       if (!this.userSpeaking) { this.userSpeaking = true; events.push({ t: 'speechStarted' }); }
@@ -405,7 +412,7 @@ export class SpeechGate {
   }
 }
 
-// Enforces the speaking style in code. A reply whose audio passes 20 s is cut, and code-like text in the transcript (code, paths, URLs, file names, diffs) is flagged once so the model can be corrected afterwards.
+// Enforces the speaking style in code. A reply whose audio passes 20 s is cut, and code-like text in the transcript (code, paths, URLs, file names, diffs) is flagged once so the model can be corrected afterwards. With allowCode the text is not checked, for a run_shell question that reads the command aloud on purpose.
 export class SpeechPolicy {
   static MAX_AUDIO_SECONDS = 20;
   static LEAKS = [
@@ -422,9 +429,11 @@ export class SpeechPolicy {
   audioBytes = 0;
   lengthFlagged = false;
 
+  constructor(allowCode = false) { this.allowCode = allowCode; }
+
   // Feed each transcript piece. Returns { leak: 'a file path' } at most once per reply, else null.
   feed(piece) {
-    if (this.leakFlagged) return null;
+    if (this.leakFlagged || this.allowCode) return null;
     this.text += piece;
     const hit = SpeechPolicy.LEAKS.find(([re]) => re.test(this.text));
     if (!hit) return null;
@@ -534,13 +543,21 @@ export function rms(pcm) {
   return n ? Math.sqrt(sum / n) : 0;
 }
 
-// The PipeWire node to record from or play to. HERDR_VOICE_MIC / HERDR_VOICE_SPEAKER win; else the echo-cancelled june_ec_* node if PipeWire has it; else null for the default device.
+// Input: the output of `pactl list sources` or `pactl list sinks`. Output: the names of the nodes made by PipeWire's echo-cancel module, which tags them with a node.group starting "echo-cancel-". Monitor sources are left out.
+export function echoCancelNodes(listing) {
+  return listing.split(/\n(?=(?:Source|Sink) #\d+)/)
+    .filter((entry) => /node\.group = "echo-cancel-/.test(entry))
+    .map((entry) => entry.match(/^\s*Name: (\S+)/m)?.[1])
+    .filter((name) => name && !name.endsWith('.monitor'));
+}
+
+// The PipeWire node to record from or play to. HERDR_VOICE_MIC / HERDR_VOICE_SPEAKER win; then june_ec_*; then the first node the echo-cancel module made; else null for the default device.
 function pickTarget(kind) {
   const forced = process.env[kind === 'source' ? 'HERDR_VOICE_MIC' : 'HERDR_VOICE_SPEAKER'];
   if (forced) return forced;
-  const name = kind === 'source' ? 'june_ec_source' : 'june_ec_sink';
-  const listed = spawnSync('pactl', ['list', 'short', `${kind}s`], { encoding: 'utf8' }).stdout ?? '';
-  return listed.split('\n').some((line) => line.split('\t')[1] === name) ? name : null;
+  const june = kind === 'source' ? 'june_ec_source' : 'june_ec_sink';
+  const listing = spawnSync('pactl', ['list', `${kind}s`], { encoding: 'utf8' }).stdout ?? '';
+  return listing.includes(`Name: ${june}\n`) ? june : echoCancelNodes(listing)[0] ?? null;
 }
 
 // Records 16 kHz mono s16le from pw-record and hands out 20 ms chunks.
@@ -621,7 +638,11 @@ export class Session {
     this.pendingOutputs = [];
     this.pendingTexts = [];
     this.outbox = [];
-    this.renewWhenIdle = false;
+    this.renewTimer = null;
+    this.lastAudioAt = 0;
+    this.waitingSince = 0;
+    this.closed = false;
+    this.toolQueue = Promise.resolve();
     this.deduper = new CallDeduper();
     this.recap = new Recap();
     this.policy = new SpeechPolicy();
@@ -644,6 +665,7 @@ export class Session {
     this.mic?.start((chunk) => this.micChunk(chunk), (why) => { log(`x microphone: ${why}`); this.onFatal?.(); });
     this.connect();
     if (this.gated) this.quietTimer = setInterval(() => this.checkQuiet(), 5000);
+    this.watchdog = setInterval(() => this.checkAlive(), 5000);
   }
 
   // Records the first time something happened, for the selftest's timing.
@@ -731,7 +753,8 @@ export class Session {
     this.wire = new GeminiWire();
     this.pendingOutputs = [];
     this.pendingTexts = [];
-    this.renewWhenIdle = false;
+    clearInterval(this.renewTimer);
+    this.waitingSince = this.lastAudioAt = 0;
     this.resumedWithContext = this.resumeHandle !== null;
     // The key travels in a header, so no URL that could be logged ever contains it.
     const ws = new WebSocket(ENDPOINT, { headers: { 'x-goog-api-key': this.key } });
@@ -749,14 +772,34 @@ export class Session {
     log(this.hadSession || this.attempts > 0 ? '↻ reconnecting to Gemini' : `● connecting to Gemini (${this.model}); speak any time, say "stop" to stop the voice`);
   }
 
+  // Closes the socket. Returns a promise that resolves once the close handshake is done.
   closeSocket() {
     const ws = this.socket;
     this.socket = null; // its close must not count as a failure
     this.status = 'disconnected';
-    try { ws?.close(1000); } catch { /* already closed */ }
+    if (!ws || ws.readyState === 3) return Promise.resolve();
+    return new Promise((done) => {
+      ws.addEventListener('close', done, { once: true });
+      try { ws.close(1000); } catch { done(); }
+    });
+  }
+
+  // Treats the socket as lost (a failed send, or no answer from Gemini) and goes through the normal reconnect path.
+  socketDead(detail) {
+    const ws = this.socket;
+    if (!ws) return;
+    try { ws.close(); } catch { /* already closed */ }
+    this.connectionLost(ws, detail);
+  }
+
+  // Every 5 s: reconnect if mic audio went out recently and Gemini has sent nothing since the first of it.
+  checkAlive() {
+    const now = Date.now();
+    if (this.waitingSince && now - this.lastAudioAt < AUDIO_WINDOW_MS && now - this.waitingSince > DEAD_AFTER_MS) this.socketDead('no reply from Gemini');
   }
 
   onMessage(text) {
+    this.waitingSince = 0;
     let events;
     try { events = this.wire.decode(JSON.parse(text)); } catch { return log('x undecodable Gemini message'); }
     if (process.env.HERDR_VOICE_DEBUG_EVENTS === '1') {
@@ -808,7 +851,7 @@ export class Session {
 
   // Replaces the connection before Gemini drops it, resuming the same session with its context.
   renewConnection() {
-    this.renewWhenIdle = false;
+    clearInterval(this.renewTimer);
     if (this.status !== 'live') return;
     log('↻ renewing the connection (Gemini limits how long one lasts)');
     this.closeSocket();
@@ -816,17 +859,33 @@ export class Session {
     this.connect();
   }
 
-  // Closes the session cleanly so billing stops at once; call before exiting.
+  // Renews the connection Gemini is about to close, once nothing is being said or run, or when the deadline is near.
+  renewIfIdle(deadline) {
+    const idle = !this.replies.responseActive && !this.speaker.isSpeaking && this.replies.callsInFlight === 0;
+    if (idle || Date.now() >= deadline) this.renewConnection();
+  }
+
+  // Closes the session cleanly so billing stops at once; call before exiting. Returns a promise that resolves once the socket is closed and the tools' processes have ended.
   shutdown() {
+    this.closed = true;
     clearInterval(this.quietTimer);
-    this.closeSocket();
+    clearInterval(this.watchdog);
+    clearInterval(this.renewTimer);
+    const closing = this.closeSocket();
     this.mic?.stop();
     this.speaker.interrupt();
-    this.tools.stop?.();
+    return Promise.all([closing, this.tools.stop?.()]);
   }
 
   sendRaw(obj) {
-    if (this.socket?.readyState === 1) this.socket.send(JSON.stringify(obj));
+    const ws = this.socket;
+    if (ws?.readyState !== 1) return;
+    if (obj.realtimeInput?.audio) {
+      const now = Date.now();
+      if (!this.waitingSince || now - this.lastAudioAt > AUDIO_WINDOW_MS) this.waitingSince = now;
+      this.lastAudioAt = now;
+    }
+    try { ws.send(JSON.stringify(obj)); } catch (e) { this.socketDead(`send failed: ${e.message}`); }
   }
 
   // ----- what Gemini says -----
@@ -847,7 +906,8 @@ export class Session {
         this.replies.responseCreated();
         this.midTurn = false;
         this.dropping = false;
-        this.policy = new SpeechPolicy();
+        // A run_shell question reads the command aloud on purpose.
+        this.policy = new SpeechPolicy(this.tools.pendingAction?.()?.startsWith('run_shell') === true);
         break;
       case 'assistantDelta': {
         const verdict = this.policy.feed(e.text);
@@ -862,12 +922,15 @@ export class Session {
         log(`voice: ${e.text.trim()}`);
         this.recap.add('voice', e.text);
         break;
+      case 'userPiece':
+        // The voice's own echo can sound like a "yes", so speech heard while the voice plays, or just after, never confirms anything.
+        if (this.hearingOwnVoice) this.overlapped = true;
+        if (!this.overlapped) this.tools.heard?.(e.text);
+        break;
       case 'user':
         log(`you:   ${e.text}`);
         this.recap.add('you', e.text);
-        // The voice's own echo can sound like a "yes", so speech that began over playback never confirms anything.
         if (this.overlapped) log('… you spoke over the voice; that cannot confirm anything (it may be its own echo). Say it again.');
-        else this.tools.heard?.(e.text);
         this.overlapped = false;
         this.correctedLeak = false;
         if (isStopCommand(e.text)) this.stopSpeech();
@@ -884,7 +947,10 @@ export class Session {
         else if (this.speaker.isSpeaking) log('… kept talking: the mic did not hear you (echo or noise)');
         break;
       case 'call':
-        this.runTool(e.id, e.name, e.args);
+        // Counted now, so the reply waits for every call of the turn; run one after another, in the order the model made them.
+        this.replies.callStarted();
+        const connection = this.connection;
+        this.toolQueue = this.toolQueue.then(() => this.runTool(e.id, e.name, e.args, connection)).catch((err) => log(`x ${e.name}: ${err.message}`));
         break;
       case 'error':
         log(`x ${e.message}`);
@@ -893,18 +959,23 @@ export class Session {
         this.correctLeak();
         // Tool results from this turn are answered together, in one reply, once it is finished.
         if (this.replies.responseDone()) this.requestResponse();
-        if (this.renewWhenIdle && !this.replies.responseActive && this.replies.callsInFlight === 0) this.renewConnection();
         break;
       case 'handle':
         this.resumeHandle = e.handle;
         break;
-      case 'ending':
-        // Gemini closes connections after about 10 minutes and warns first. Renew now, or right after whatever is being said or run finishes.
-        if (this.replies.responseActive || this.speaker.isSpeaking || this.replies.callsInFlight > 0) this.renewWhenIdle = true;
-        else this.renewConnection();
+      case 'ending': {
+        // Gemini closes connections after about 10 minutes and warns first. Renew once whatever is being said or run has finished, and in any case before the deadline it gave.
+        const deadline = Date.now() + e.timeLeftMs - GOAWAY_MARGIN_MS;
+        clearInterval(this.renewTimer);
+        this.renewTimer = setInterval(() => this.renewIfIdle(deadline), 250);
+        this.renewIfIdle(deadline);
         break;
+      }
     }
   }
+
+  // True while the voice is playing and for ECHO_TAIL_MS after it ends, when the microphone can still hear it.
+  get hearingOwnVoice() { return this.speaker.isSpeaking || Date.now() < this.speaker.until + ECHO_TAIL_MS; }
 
   // Stops the voice mid-sentence (a spoken "stop" or the Esc key): drops queued audio and the rest of the reply. `reason` goes in the log line.
   stopSpeech(reason = 'you said stop') {
@@ -946,7 +1017,9 @@ export class Session {
 
   // A message from the tools (an agent finished or needs approval) that should get a spoken reply. It waits for the next session if this one is closed, and reopens one.
   report(text) {
+    if (this.closed) return;
     log(`← ${text.split('\n')[0].slice(0, 100)}`);
+    this.lastSpeech = Date.now(); // the developer needs time to answer, so the quiet timer starts over
     if (this.status === 'live' && this.established) {
       this.pendingTexts.push(text);
       if (this.replies.wantReply()) this.requestResponse(); // otherwise it joins the reply already on its way
@@ -956,25 +1029,26 @@ export class Session {
     if (this.status === 'disconnected') { this.attempts = 0; this.connect(); }
   }
 
-  async runTool(id, name, args) {
+  // Runs one tool call that the model made on connection number `connection`, then hands the result back.
+  async runTool(id, name, args, connection) {
     if (!this.deduper.admit(name, args)) {
       log(`⤫ ${name} repeated within seconds; not run again`);
-      this.replies.callStarted();
-      this.answerTool(id, name, { output: "Duplicate of a call made moments ago; it was not run again. Don't repeat calls." });
-      return;
+      return this.finishTool(connection, id, name, { output: "Duplicate of a call made moments ago; it was not run again. Don't repeat calls." });
     }
     this.mark('toolCall');
-    this.replies.callStarted();
     log(`→ ${name} ${JSON.stringify(args)}`);
     if (name === 'run_shell' && typeof args.command === 'string') log(`   $ ${args.command}`); // the exact command the developer is asked to approve
     this.toolsRunning++;
-    const connection = this.connection;
     let output;
     try { output = await this.tools.run(name, args); } catch (e) { output = { error: String(e?.message ?? e) }; }
     this.toolsRunning--;
-    // A result for a call from a session that has since closed has nowhere to go.
-    if (this.connection !== connection || this.status !== 'live') return;
-    this.answerTool(id, name, output);
+    this.finishTool(connection, id, name, output);
+  }
+
+  // Answers the call. If the connection it was made on has since been replaced, the new session does not know the call's id, so the result goes to it as a text turn instead.
+  finishTool(connection, id, name, output) {
+    if (this.connection === connection && this.status === 'live') return this.answerTool(id, name, output);
+    this.report(`[herdr] The ${name} call finished after the connection was renewed, so it could not be answered directly. Its result: ${JSON.stringify(output)}`);
   }
 
   answerTool(id, name, output) {
@@ -1032,11 +1106,19 @@ export function keyAction(text) {
   }
 }
 
-// One herdr-voice at a time: a second would share the mic, hear the first one's voice and double the bill. The lock is a pid file, valid while that pid is a running herdr-voice.
+// Whether process `pid` is running this script: one of its command-line arguments, taken from its working directory and followed through symlinks, is this file.
+function runsThisScript(pid) {
+  const cwd = readlinkSync(`/proc/${pid}/cwd`);
+  return readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').some((arg) => {
+    try { return arg !== '' && realpathSync(resolve(cwd, arg)) === SELF; } catch { return false; }
+  });
+}
+
+// One herdr-voice at a time: a second would share the mic, hear the first one's voice and double the bill. The lock is a pid file, valid while that pid is running this script.
 function runningPid() {
   try {
     const pid = parseInt(readFileSync(LOCK_FILE, 'utf8'), 10);
-    if (pid > 0 && pid !== process.pid && readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('herdr-voice')) return pid;
+    if (pid > 0 && pid !== process.pid && runsThisScript(pid)) return pid;
   } catch { /* no lock file, or its process is gone */ }
   return null;
 }
@@ -1105,7 +1187,7 @@ async function main() {
   const voice = process.env.HERDR_VOICE_VOICE || DEFAULT_VOICE;
   const micTarget = pickTarget('source'), speakerTarget = pickTarget('sink');
   log(`herdr-voice: ${model}, voice ${voice}, mic ${micTarget ?? 'default'}, speaker ${speakerTarget ?? 'default'}`);
-  if (!process.env.HERDR_VOICE_MIC && !micTarget) log('! no echo cancellation (no june_ec_source in PipeWire): use headphones or the voice will hear itself');
+  if (!process.env.HERDR_VOICE_MIC && !micTarget) log('! no echo cancellation (no echo-cancel source in PipeWire): use headphones or the voice will hear itself');
   if (process.env.HERDR_ENV !== '1') log('! not inside a Herdr pane; herdr commands will target the focused session and close tools are off');
 
   const { createTools } = await import('./tools.mjs');
@@ -1118,14 +1200,15 @@ async function main() {
     threshold: Number.isFinite(threshold) ? threshold : null,
     greet: !selftest,
   });
+  // Waits for the socket to close and the child processes to end, but no longer than SHUTDOWN_CAP_MS.
   const quit = async (code) => {
-    session.shutdown();
-    await new Promise((resolve) => setTimeout(resolve, 300)); // a moment for the WebSocket close frame to go out
+    await Promise.race([session.shutdown(), new Promise((resolve) => setTimeout(resolve, SHUTDOWN_CAP_MS))]);
     log('herdr-voice closed');
     process.exit(code);
   };
   session.onFatal = () => quit(1);
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => quit(0));
+  for (const event of ['uncaughtException', 'unhandledRejection']) process.on(event, (err) => { console.error(`x ${event}: ${err?.stack ?? err}`); quit(1); });
 
   // In a terminal the pane takes single keys, since there is no orb to click. Raw mode is switched off again on exit.
   if (process.stdin.isTTY && !selftest) {

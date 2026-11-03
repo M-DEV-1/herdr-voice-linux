@@ -1,7 +1,8 @@
 // Run with: node --test linux/*.test.mjs
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { GeminiWire, ResponseScheduler, Session, SpeechGate, hidesOnStart, keyAction, parseConfig, rms, setupMessage } from './herdr-voice.mjs';
+import { GeminiWire, ResponseScheduler, Session, SpeechGate, SpeechPolicy, echoCancelNodes, hidesOnStart, keyAction, parseConfig, rms, setupMessage } from './herdr-voice.mjs';
+import { ConfirmGate, createTools } from './tools.mjs';
 
 const SAMPLES_PER_CHUNK = 320; // 20 ms at 16 kHz
 
@@ -87,8 +88,8 @@ const audio = (data = 'QUJD') => ({ serverContent: { modelTurn: { parts: [{ inli
 test('you speak, then it answers: transcript pieces are joined and audio starts the reply', () => {
   const w = wire();
   assert.deepEqual(w.decode({ setupComplete: {} }), [{ t: 'ignored', what: 'setupComplete' }]);
-  assert.deepEqual(w.decode({ serverContent: { inputTranscription: { text: 'tell claude' } } }), [{ t: 'speechStarted' }]);
-  assert.equal(w.decode({ serverContent: { inputTranscription: { text: ' to run the tests' } } })[0].t, 'ignored');
+  assert.deepEqual(w.decode({ serverContent: { inputTranscription: { text: 'tell claude' } } }), [{ t: 'speechStarted' }, { t: 'userPiece', text: 'tell claude' }]);
+  assert.deepEqual(w.decode({ serverContent: { inputTranscription: { text: ' to run the tests' } } }), [{ t: 'userPiece', text: ' to run the tests' }]);
   assert.deepEqual(w.decode(audio()), [
     { t: 'speechStopped' }, { t: 'user', text: 'tell claude to run the tests' }, { t: 'responseCreated' }, { t: 'audio', b64: 'QUJD' },
   ]);
@@ -124,7 +125,7 @@ test('a turn that produced nothing still releases the scheduler', () => {
 
 test('goAway and resumption handles are surfaced, unresumable handles are not', () => {
   const w = wire();
-  assert.deepEqual(w.decode({ goAway: { timeLeft: '10s' } }), [{ t: 'ending' }]);
+  assert.deepEqual(w.decode({ goAway: { timeLeft: '10s' } }), [{ t: 'ending', timeLeftMs: 10000 }]);
   assert.deepEqual(w.decode({ sessionResumptionUpdate: { resumable: true, newHandle: 'h-1' } }), [{ t: 'handle', handle: 'h-1' }]);
   assert.equal(w.decode({ sessionResumptionUpdate: { resumable: false, newHandle: '' } })[0].t, 'ignored');
 });
@@ -185,4 +186,109 @@ test('a muted microphone neither wakes the session nor keeps audio, and unmuting
 test('the voice pane starts visible unless HERDR_VOICE_START_HIDDEN=1', () => {
   const env = { HERDR_ENV: '1', HERDR_PANE_ID: 'p', HERDR_PLUGIN_ENTRYPOINT_ID: 'voice' };
   assert.deepEqual([env, { ...env, HERDR_VOICE_START_HIDDEN: '1' }].map(hidesOnStart), [false, true]);
+});
+
+// A session already connected to a recording socket, with the given tools and speaker. Server messages are fed in with feed().
+function liveSession({ tools = {}, speaker = { isSpeaking: false, until: 0, interrupt() {} }, createTools: make } = {}) {
+  const session = new Session({ key: 'k', model: 'm', voice: 'v', greet: false, speaker, createTools: make ?? (() => ({ declarations: [], run: async () => ({ output: 'x' }), ...tools })) });
+  const sent = [];
+  session.socket = { readyState: 1, send: (text) => sent.push(JSON.parse(text)), addEventListener(_, done) { this.done = done; }, close() { this.done?.(); } };
+  session.status = 'live';
+  session.established = true;
+  return { session, sent, feed: (msg) => session.onMessage(JSON.stringify(msg)) };
+}
+const said = (text) => ({ serverContent: { inputTranscription: { text } } });
+
+test('speech heard while the voice plays, or within half a second after, never reaches the confirmation gate', () => {
+  const heard = [];
+  const speaker = { isSpeaking: true, until: Date.now() + 3000, play() {}, interrupt() {} };
+  const { feed } = liveSession({ tools: { heard: (t) => heard.push(t) }, speaker });
+  // Gemini sends no speech-started signal while the model's own turn is running.
+  feed({ serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AAAA' } }] } } });
+  feed(said('okay close the forge tab'));
+  speaker.isSpeaking = false;
+  speaker.until = Date.now() - 200;
+  feed(said('yes'));
+  assert.deepEqual(heard, []);
+  feed({ serverContent: { turnComplete: true } });
+  speaker.until = Date.now() - 1000;
+  feed(said('yes'));
+  assert.deepEqual(heard, ['yes']);
+});
+
+test('a yes transcribed after the confirmed tool call still confirms it', async () => {
+  const gate = new ConfirmGate({ minDelay: 0, wait: 500 });
+  const commands = [];
+  const runHerdr = async (args) => { commands.push(args.join(' ')); return '{}'; };
+  const { session, sent, feed } = liveSession({ createTools: () => createTools({ emit() {}, env: {}, runHerdr, gate }) });
+  assert.match((await session.tools.run('rename_agent', { target: 'a', name: 'b' })).output, /^CONFIRMATION REQUIRED/);
+  feed({ toolCall: { functionCalls: [{ id: 'c1', name: 'rename_agent', args: { target: 'a', name: 'b', confirmed: true } }] } });
+  feed(said('yes'));
+  await session.toolQueue;
+  assert.deepEqual(commands, ['agent rename a b']);
+  assert.match(sent.at(-1).toolResponse.functionResponses[0].response.output, /^done: rename agent a to b/);
+});
+
+test('a run_shell question may read the command aloud, any other reply may not', () => {
+  const { session } = liveSession({ tools: { pendingAction: () => 'run_shell:/tmp:ls ~/code/app' } });
+  const speak = () => {
+    session.handle({ t: 'responseCreated' });
+    session.handle({ t: 'assistantDelta', text: 'Run ls ~/code/app in the api folder?' });
+  };
+  speak();
+  assert.equal(session.leaked, null);
+  session.tools.pendingAction = () => 'close_tab:t1';
+  speak();
+  assert.equal(session.leaked, 'a file path');
+  assert.deepEqual(new SpeechPolicy(true).feed('see `x`'), null);
+});
+
+test('a report reopening a closed session keeps the quiet timer from closing it again', () => {
+  const { session } = liveSession();
+  session.status = 'disconnected';
+  session.socket = null;
+  session.dormant = true;
+  session.lastSpeech = Date.now() - 10 * 60_000;
+  session.connect = () => { session.status = 'connecting'; };
+  session.report('[herdr] Agent claude is now idle.');
+  // The session is up again and the reply to the report is finished.
+  Object.assign(session, { status: 'live', established: true, outbox: [] });
+  session.replies.reset();
+  session.checkQuiet();
+  assert.equal(session.status, 'live');
+});
+
+test('the calls of one tool turn run one at a time, in order, and are answered together', async () => {
+  const order = [];
+  let release;
+  const run = async (name) => {
+    order.push(`start ${name}`);
+    if (name === 'first') await new Promise((resolve) => { release = resolve; });
+    order.push(`end ${name}`);
+    return { output: name };
+  };
+  const { session, sent, feed } = liveSession({ tools: { run } });
+  feed({ toolCall: { functionCalls: [{ id: 'c1', name: 'first', args: {} }, { id: 'c2', name: 'second', args: {} }] } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(order, ['start first']);
+  release();
+  await session.toolQueue;
+  assert.deepEqual(order, ['start first', 'end first', 'start second', 'end second']);
+  const responses = sent.filter((m) => m.toolResponse);
+  assert.equal(responses.length, 1);
+  assert.deepEqual(responses[0].toolResponse.functionResponses.map((r) => r.name), ['first', 'second']);
+});
+
+test('shutdown waits for the tools to stop', async () => {
+  let stopped = false;
+  const { session } = liveSession({ tools: { stop: () => new Promise((resolve) => setTimeout(() => { stopped = true; resolve(); }, 30)) } });
+  await session.shutdown();
+  assert.equal(stopped, true);
+});
+
+test('echo-cancel nodes are found by their node.group, not by name, and monitors are skipped', () => {
+  const entry = (kind, id, name, group) => `${kind} #${id}\n\tState: SUSPENDED\n\tName: ${name}\n\tProperties:\n\t\tnode.name = "${name}"\n${group ? `\t\tnode.group = "${group}"\n` : ''}\tFormats:\n\t\tpcm\n`;
+  const listing = [entry('Source', 1, 'alsa_input.pci', ''), entry('Source', 2, 'echo-cancel-source', 'echo-cancel-77-12'), entry('Source', 3, 'echo-cancel-sink.monitor', 'echo-cancel-77-12')].join('\n');
+  assert.deepEqual(echoCancelNodes(listing), ['echo-cancel-source']);
+  assert.deepEqual(echoCancelNodes(entry('Sink', 4, 'alsa_output.pci', '')), []);
 });
