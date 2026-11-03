@@ -6,6 +6,7 @@ import { chmodSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync,
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { startOrb } from './orb-link.mjs';
 import { createTools, herdrBinary } from './tools.mjs';
 
 const PLUGIN_ID = 'brogrammermw.herdr-voice';
@@ -135,6 +136,8 @@ const CONFIG_TEMPLATE = `# herdr-voice settings. Uncomment a line to use it; res
 # HERDR_VOICE_CONFIRM=1
 # Hide the voice pane behind the pane you started it from (that pane is zoomed over it) instead of showing it below
 # HERDR_VOICE_START_HIDDEN=1
+# Set to 0 to turn off the tray icon
+# HERDR_VOICE_ORB=0
 `;
 
 // Input: the text of config.env. Output: the HERDR_VOICE_* settings as [key, value] pairs, and the names of lines that were refused.
@@ -755,6 +758,7 @@ export class Session {
     this.lastLoud = 0;
     this.overlapped = false;
     this.toolsRunning = 0;
+    this.micLevel = 0;
     this.marks = {};
     this.meter = { peak: 0, chunks: 0 };
     this.tools = createTools({ emit: (text) => this.report(text) });
@@ -782,6 +786,7 @@ export class Session {
     let level = rms(chunk);
     // The voice's own echo counts as the noise floor, so it neither opens the gate nor teaches the floor the quieter audio the canceller leaves during playback.
     if (this.echo.isEcho(level, this.speaker.level(Date.now()))) level = this.gate.noiseFloor;
+    this.micLevel = level;
     const wasOpen = this.gate.isOpen;
     if (this.gated && level > this.gate.openThreshold) this.lastLoud = Date.now();
     const chunks = this.gated ? this.gate.process(chunk, level, this.midTurn) : [chunk];
@@ -1197,6 +1202,15 @@ function hideVoicePane(voicePane) {
   if (cover) herdr(['pane', 'zoom', cover, '--on']);
 }
 
+// Whether the voice pane is out of sight, which is when the tab holding it is zoomed.
+const voicePaneHidden = (voicePane) => field(herdr(['pane', 'layout', '--pane', voicePane]).stdout, 'result', 'layout', 'zoomed') === true;
+
+// Shows the voice pane by unzooming its tab, or hides it if it is showing. Used by the tray icon's Show/Hide voice pane.
+function toggleVoicePane(voicePane) {
+  if (voicePaneHidden(voicePane)) herdr(['pane', 'zoom', voicePane, '--off']);
+  else hideVoicePane(voicePane);
+}
+
 // Maps the text of one keyboard read in the voice pane to what the voice does. Output: 'mute', 'stop', 'quit', or null for any other key. Arrow keys begin with the Esc byte, so only a read that is exactly Esc stops the voice.
 export function keyAction(text) {
   switch (text) {
@@ -1314,11 +1328,18 @@ async function main() {
   });
   // Waits for the socket to close and the child processes to end, but no longer than SHUTDOWN_CAP_MS.
   const quit = async (code) => {
+    orb?.close();
     await Promise.race([session.shutdown(), new Promise((resolve) => setTimeout(resolve, SHUTDOWN_CAP_MS))]);
     log('herdr-voice closed');
     process.exit(code);
   };
   session.onFatal = () => quit(1);
+  const voicePane = process.env.HERDR_ENV === '1' ? process.env.HERDR_PANE_ID : undefined;
+  const orb = startOrb({
+    session, log,
+    on: { mute: toggleMute, quit: () => quit(0) },
+    pane: voicePane && { state: () => (voicePaneHidden(voicePane) ? 'hidden' : 'shown'), toggle: () => toggleVoicePane(voicePane) },
+  });
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => quit(0));
   for (const event of ['uncaughtException', 'unhandledRejection']) process.on(event, (err) => { console.error(`x ${event}: ${err?.stack ?? err}`); quit(1); });
 

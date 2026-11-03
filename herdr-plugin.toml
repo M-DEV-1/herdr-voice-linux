@@ -7,6 +7,7 @@ description = "Talk to your Herdr agents: realtime Gemini Live voice that drives
 platforms = ["linux"]
 
 # Needs Node 22 or newer and PipeWire (pw-record, pw-play). There is nothing to build.
+# The tray icon, linux/orb.js, also needs gjs and the AppIndicator typelib (gir1.2-ayatanaappindicator3-0.1); without them the voice runs without it.
 # To put the herdr-voice command on your PATH, run once: herdr plugin action invoke install-command --plugin brogrammermw.herdr-voice
 
 # The voice itself: a split pane showing the live transcript. Closing the pane stops it.
