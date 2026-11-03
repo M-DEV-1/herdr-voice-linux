@@ -3,33 +3,27 @@ id = "brogrammermw.herdr-voice"
 name = "herdr-voice"
 version = "1.4.1"
 min_herdr_version = "0.9.0"
-description = "Talk to your Herdr agents: realtime voice (Grok, OpenAI or Gemini) that drives Claude Code and Codex panes, with a floating orb"
-platforms = ["macos"]
+description = "Talk to your Herdr agents: realtime Gemini Live voice that drives Claude Code and Codex panes, in a Herdr pane"
+platforms = ["linux"]
 
-# Needs Swift 5.10+ (Xcode or the Command Line Tools). The first build takes a minute or two.
-[[build]]
-command = ["swift", "build", "-c", "release"]
-
-# Puts the `herdr-voice` command on your PATH (a small launcher script in ~/.local/bin), so typing herdr-voice in any pane starts the voice.
-# Undo with: herdr-voice uninstall-command
-[[build]]
-command = [".build/release/herdr-voice", "install-command"]
+# Needs Node 22 or newer and PipeWire (pw-record, pw-play). There is nothing to build.
+# To put the herdr-voice command on your PATH, run once: node linux/herdr-voice.mjs install-command
 
 # The voice itself: a split pane showing the live transcript. Closing the pane stops it.
 [[panes]]
 id = "voice"
 title = "herdr-voice"
 placement = "split"
-command = [".build/release/herdr-voice", "--here"]
+command = ["node", "linux/herdr-voice.mjs", "--here"]
 
-# Store an API key in the macOS Keychain (hidden input).
+# Save the Gemini API key to ~/.config/herdr-voice/gemini.key (hidden input).
 [[panes]]
 id = "setup"
 title = "herdr-voice setup"
 placement = "popup"
 width = "70%"
 height = 16
-command = [".build/release/herdr-voice", "setup"]
+command = ["node", "linux/herdr-voice.mjs", "setup"]
 
 # Same as typing herdr-voice: opens the voice pane below the focused pane, hidden behind it unless
 # HERDR_VOICE_START_HIDDEN=0. Bind it to a key (see the README).
@@ -37,7 +31,7 @@ command = [".build/release/herdr-voice", "setup"]
 id = "start"
 title = "Start voice"
 contexts = ["workspace"]
-command = [".build/release/herdr-voice"]
+command = ["node", "linux/herdr-voice.mjs"]
 
 [[actions]]
 id = "setup"
