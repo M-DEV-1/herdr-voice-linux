@@ -4,7 +4,7 @@ import test from 'node:test';
 import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { EchoGuard, GeminiWire, Mic, PlaybackLevels, ResponseScheduler, Session, SpeechGate, SpeechPolicy, echoCancelNodes, hidesOnStart, keyAction, parseConfig, rms, setupMessage } from './herdr-voice.mjs';
+import { EchoGuard, GeminiWire, Mic, PlaybackLevels, ResponseScheduler, Session, SpeechGate, SpeechPolicy, echoCancelNodes, hidesOnStart, systemPrompt, keyAction, parseConfig, rms, setupMessage } from './herdr-voice.mjs';
 import { ConfirmGate, createTools } from './tools.mjs';
 
 const SAMPLES_PER_CHUNK = 320; // 20 ms at 16 kHz
@@ -116,6 +116,15 @@ test('parallel tool calls arrive as one turn, after what the voice said first', 
   ]);
 });
 
+test('Gemini voice activity marks your speech start and end, and transcript pieces after it do not restart it', () => {
+  const w = new GeminiWire();
+  const kinds = (msg) => w.decode(msg).map((e) => e.t);
+  assert.deepEqual(kinds({ voiceActivity: { type: 'ACTIVITY_START' } }), ['speechStarted']);
+  assert.deepEqual(kinds({ serverContent: { inputTranscription: { text: 'list my' } }, voiceActivity: { type: 'ACTIVITY_END' } }), ['userPiece', 'speechStopped']);
+  assert.deepEqual(kinds({ serverContent: { inputTranscription: { text: ' agents' } } }), ['userPiece']);
+  assert.deepEqual(w.decode({ toolCall: { functionCalls: [{ id: '1', name: 'list_agents' }] } }).find((e) => e.t === 'user').text, 'list my agents');
+});
+
 test('talking over the model is a barge-in and ends its turn', () => {
   const w = wire();
   w.decode(audio());
@@ -144,6 +153,8 @@ test('setup carries the model, voice, tools and session features', () => {
   assert.deepEqual(s.tools, [{ functionDeclarations: [{ name: 'list_agents', description: 'List agents', parametersJsonSchema: declarations[0].parameters }] }]);
   assert.equal(s.sessionResumption.handle, 'h-42');
   assert.deepEqual(s.contextWindowCompression, { slidingWindow: {} });
+  assert.doesNotMatch(systemPrompt(false), /confirmed|CONFIRMATION REQUIRED/);
+  assert.match(systemPrompt(true), /confirmed=true/);
   assert.deepEqual(s.realtimeInputConfig.automaticActivityDetection, { startOfSpeechSensitivity: 'START_SENSITIVITY_LOW', prefixPaddingMs: 300, silenceDurationMs: 800 });
   // Only the 2.x models take Google Search beside function tools.
   assert.equal(setupMessage({ ...base, model: 'gemini-2.5-flash-native-audio-preview-12-2025' }).setup.tools.length, 2);
@@ -224,7 +235,7 @@ test('a yes transcribed after the confirmed tool call still confirms it', async 
   const gate = new ConfirmGate({ minDelay: 0, wait: 500 });
   const commands = [];
   const runHerdr = async (args) => { commands.push(args.join(' ')); return '{}'; };
-  const { session, sent, feed } = liveSession({ createTools: () => createTools({ emit() {}, env: {}, runHerdr, gate }) });
+  const { session, sent, feed } = liveSession({ createTools: () => createTools({ emit() {}, env: { HERDR_VOICE_CONFIRM: '1' }, runHerdr, gate }) });
   assert.match((await session.tools.run('rename_agent', { target: 'a', name: 'b' })).output, /^CONFIRMATION REQUIRED/);
   feed({ toolCall: { functionCalls: [{ id: 'c1', name: 'rename_agent', args: { target: 'a', name: 'b', confirmed: true } }] } });
   feed(said('yes'));
@@ -342,17 +353,25 @@ test('playback levels follow when audio plays, not when it was written', () => {
   assert.equal(levels.at(1900), 0);
 });
 
-test('the microphone drops the first second after pw-record starts', async () => {
+test('the microphone drops the first second of each pw-record run and restarts pw-record when it exits', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'herdr-voice-mic-'));
-  // A pw-record stand-in: 1 s of bytes 1, then 0.5 s of bytes 2, then it exits.
+  // A pw-record stand-in: 1 s of bytes 1, then 0.5 s of bytes 2, then it exits as on a PipeWire restart.
   writeFileSync(join(dir, 'pw-record'), "#!/bin/sh\nhead -c 32000 /dev/zero | tr '\\0' '\\1'\nhead -c 16000 /dev/zero | tr '\\0' '\\2'\n");
   chmodSync(join(dir, 'pw-record'), 0o755);
   const path = process.env.PATH;
   process.env.PATH = `${dir}:${path}`;
-  const chunks = [];
+  const mic = new Mic(null), chunks = [];
+  let died = null;
   try {
-    await new Promise((done) => new Mic(null).start((c) => chunks.push(c), done));
-  } finally { process.env.PATH = path; }
-  assert.equal(chunks.length, 25);
+    await new Promise((done) => {
+      mic.start((c) => { chunks.push(c); if (chunks.length === 50) done(); }, (why) => { died = why; done(); });
+      setTimeout(done, 5000);
+    });
+  } finally {
+    mic.stop();
+    process.env.PATH = path;
+  }
+  assert.equal(died, null);
+  assert.equal(chunks.length, 50);
   assert.ok(chunks.every((c) => c.every((b) => b === 2)));
 });

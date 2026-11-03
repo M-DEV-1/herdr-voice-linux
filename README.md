@@ -20,14 +20,16 @@ Everything below this section describes the macOS original.
 
 ```sh
 herdr plugin install M-DEV-1/herdr-voice-linux
-node linux/herdr-voice.mjs install-command   # from the plugin's directory; links herdr-voice into ~/.local/bin
-herdr-voice setup                            # saves the API key to ~/.config/herdr-voice/gemini.key
-herdr-voice                                  # in a Herdr pane: opens the voice pane below it
+herdr plugin action invoke install-command --plugin brogrammermw.herdr-voice   # links herdr-voice into ~/.local/bin
+herdr-voice setup                                                              # saves the API key to ~/.config/herdr-voice/gemini.key
+herdr-voice                                                                    # in a Herdr pane: opens the voice pane below it
 ```
 
-Instead of `install-command` you can run the plugin's "Start voice" action, which does the same as typing `herdr-voice`.
+Herdr keeps the installed copy under `~/.config/herdr/plugins/github-installations/`, in a folder that changes with each update, so run the `install-command` action again after `herdr plugin update`.
+Instead of typing `herdr-voice` you can run the plugin's "Start voice" action (`herdr plugin action invoke start --plugin brogrammermw.herdr-voice`), which opens the voice pane below the focused pane.
 `GEMINI_API_KEY` in the environment is used before the key file.
 `herdr-voice --here` runs in the current pane instead of opening a new one, and `herdr-voice stop` stops the running voice.
+`herdr-voice mute` mutes or unmutes the running voice from anywhere and shows a desktop notification; the plugin's "Mute or unmute voice" action does the same.
 The voice pane opens below the pane you started it from.
 `HERDR_VOICE_START_HIDDEN=1` zooms the pane you started it from over the voice pane instead.
 
@@ -41,6 +43,29 @@ The voice pane reads single keys while it has focus (it opens without taking foc
 | `Esc` | Stop the voice mid-sentence. |
 | `q` or `Ctrl-C` | Quit, the same as `herdr-voice stop`. |
 
+**Mute shortcut on GNOME**
+
+This registers `Ctrl+Alt+M` as a GNOME shortcut for `herdr-voice mute` (check first that `gsettings list-recursively | grep -i "<Control><Alt>m"` prints nothing, and that no other custom shortcut uses `custom0`).
+The command names node by its full path because GNOME starts it without your shell's PATH.
+
+```sh
+K=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/
+gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "['$K']"
+gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$K name 'herdr-voice mute'
+gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$K command "$(command -v node) $HOME/.local/bin/herdr-voice mute"
+gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$K binding '<Control><Alt>m'
+```
+
+To change the key, run the last line with another binding, or edit it in Settings, Keyboard, Custom Shortcuts.
+To remove it, delete it there, or run `gsettings reset org.gnome.settings-daemon.plugins.media-keys custom-keybindings`.
+
+**Confirmations**
+
+The voice does what you ask without asking "shall I?" first, including closing workspaces, tabs and panes, removing worktrees, answering an agent's approval prompt, and running shell commands when `HERDR_VOICE_SHELL=1`.
+It never closes its own workspace, tab or pane, and never force-removes a worktree with uncommitted changes.
+An action the model takes on its own right after an agent report, with nothing said by you since, is refused, so text in an agent's output can't trigger it; the voice tells you, and you say it if you want it.
+`HERDR_VOICE_CONFIRM=1` brings back the spoken yes before every risky action.
+
 **Models**
 
 The default model is `gemini-3.1-flash-live-preview`.
@@ -49,6 +74,8 @@ The default model is `gemini-3.1-flash-live-preview`.
 These and the other `HERDR_VOICE_*` settings can be exported in the environment or written in `config.env` in the plugin's config directory, which herdr-voice creates as a commented template on its first run in the plugin pane.
 
 **Echo cancellation**
+
+`HERDR_VOICE_ECHO_RATIO` (default 0.25) sets how loud the microphone must be, as a share of the voice's own playback level, to count as you rather than the voice's echo while it speaks; `0` turns this check off.
 
 Without echo cancellation the microphone hears the voice, so use headphones or set up a PipeWire echo-cancel pair.
 herdr-voice records from the PipeWire source named `june_ec_source` and plays to the sink named `june_ec_sink` when `pactl list sources` and `pactl list sinks` list them. If they are not there it uses the first source and sink made by PipeWire's echo-cancel module (their `node.group` property starts with `echo-cancel-`), and otherwise the default devices.

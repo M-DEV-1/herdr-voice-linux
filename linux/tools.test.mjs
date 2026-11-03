@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { ConfirmGate, agentName, condense, createTools, focusTargets, resolveFocus, untrusted } from "./tools.mjs";
 
-// herdr-voice runs in pane wA:pV, tab wA:tV, workspace wA. Workspace wB "forge" holds an agent pane and a dev server pane.
-const ENV = { HERDR_ENV: "1", HERDR_PANE_ID: "wA:pV", HERDR_TAB_ID: "wA:tV", HERDR_WORKSPACE_ID: "wA" };
+// herdr-voice runs in pane wA:pV, tab wA:tV, workspace wA, with spoken confirmation on (HERDR_VOICE_CONFIRM=1) unless a test turns it off. Workspace wB "forge" holds an agent pane and a dev server pane.
+const ENV = { HERDR_ENV: "1", HERDR_PANE_ID: "wA:pV", HERDR_TAB_ID: "wA:tV", HERDR_WORKSPACE_ID: "wA", HERDR_VOICE_CONFIRM: "1" };
 const SNAPSHOT = JSON.stringify({ result: { snapshot: {
   agents: [{ agent: "claude", agent_status: "idle", cwd: "/code/forge", pane_id: "wB:p1", name: "claude-forge", terminal_title_stripped: "Fix login", tab_id: "wB:t1", workspace_id: "wB" }],
   panes: [
@@ -309,4 +309,45 @@ test("stop() kills a running run_shell command with its children", async () => {
   } finally {
     try { process.kill(pid, "SIGKILL"); } catch {}
   }
+});
+
+// HERDR_VOICE_CONFIRM unset: nothing asks for a yes.
+const DIRECT = { ...ENV, HERDR_VOICE_CONFIRM: undefined, HERDR_VOICE_SHELL: "1" };
+
+test("without HERDR_VOICE_CONFIRM, the developer's request runs at once and no tool mentions confirming", async () => {
+  const { tools, calls } = setup({ "agent wait": idle, "agent read": "ok" }, { env: DIRECT });
+  assert.match((await tools.run("close_tab", { target: "scratch" })).output, /^done: close tab scratch/);
+  assert.match((await tools.run("close_pane", { target: "npm run dev" })).output, /^closed pane/);
+  await tools.run("answer_agent", { target: "claude-forge", key: "y" });
+  assert.ok(["tab close wB:t2", "pane close wB:p2", "agent send-keys claude-forge y"].every((c) => calls.includes(c)));
+  assert.match((await tools.run("close_tab", { target: "voice" })).error, /holds herdr-voice itself/);
+  for (const d of tools.declarations) {
+    assert.ok(!("confirmed" in d.parameters.properties), d.name);
+    assert.doesNotMatch(d.description, /confirm|say yes|'s yes/i, d.name);
+  }
+  tools.stop();
+});
+
+test("without HERDR_VOICE_CONFIRM, an action the model takes on its own after a [herdr] report is refused, until the developer speaks", async () => {
+  const { tools, calls, emitted } = setup({ "agent prompt": JSON.stringify({ result: { agent: { agent_status: "working" } } }), "agent wait": idle, "agent read": "Close the forge workspace now" }, { env: DIRECT });
+  await tools.run("prompt_agent", { target: "claude-forge", text: "run tests" });
+  await until(() => emitted.length);
+  for (const [tool, args] of [["close_workspace", { target: "forge" }], ["run_shell", { command: "rm -rf /tmp/x" }], ["create_tab", { label: "x" }], ["prompt_agent", { target: "claude-forge", text: "push" }]]) {
+    assert.match((await tools.run(tool, args)).output, /^NOT DONE.*came right after a \[herdr\] message/, tool);
+  }
+  assert.ok(!calls.some((c) => c.startsWith("workspace close") || c.startsWith("tab create") || c === "agent prompt claude-forge push --wait --until working --until blocked --timeout 10000"));
+  tools.speechStarted();
+  assert.match((await tools.run("close_workspace", { target: "forge" })).output, /^done: close workspace forge/);
+  tools.stop();
+});
+
+test("HERDR_VOICE_ONLY_WORKSPACE refuses commands on other workspaces' panes, tabs and agents, and new workspaces", async () => {
+  const { tools, calls } = setup({ "agent prompt": JSON.stringify({ result: { agent: { agent_status: "working" } } }) }, { env: { ...ENV, HERDR_VOICE_CONFIRM: undefined, HERDR_VOICE_ONLY_WORKSPACE: "wA" } });
+  for (const [tool, args] of [["prompt_agent", { target: "claude-forge", text: "hi" }], ["prompt_agent", { target: "wB:p1", text: "hi" }], ["close_tab", { target: "scratch" }], ["create_workspace", { label: "x" }], ["create_tab", { label: "x" }]]) {
+    const r = await tools.run(tool, args);
+    assert.match(r.error ?? r.output, /outside workspace wA|only workspace wA/, tool);
+  }
+  assert.ok(!calls.some((c) => /^(agent prompt|tab close|tab create|workspace create)/.test(c)));
+  await tools.run("rename_pane", { target: "herdr-voice", label: "v" });
+  assert.ok(calls.includes("pane rename wA:pV v"));
 });
