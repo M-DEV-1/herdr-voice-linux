@@ -6,7 +6,7 @@ I really like ChatGPT's voice agent and decided to create a version that would r
 ## Linux (this fork)
 
 This fork runs on Linux as a single Node script, `linux/herdr-voice.mjs`, with no dependencies and nothing to build.
-It talks to Google's Gemini Live API from a pane in Herdr and has no orb or other window.
+It talks to Google's Gemini Live API from a pane in Herdr and has no window of its own.
 Everything below this section describes the macOS original.
 
 **Requirements**
@@ -32,6 +32,8 @@ Instead of typing `herdr-voice` you can run the plugin's "Start voice" action (`
 `herdr-voice mute` mutes or unmutes the running voice from anywhere and shows a desktop notification; the plugin's "Mute or unmute voice" action does the same.
 The voice pane opens below the pane you started it from.
 `HERDR_VOICE_START_HIDDEN=1` zooms the pane you started it from over the voice pane instead.
+
+The tray icon (`linux/orb.js`, needs `gjs` and `gir1.2-ayatanaappindicator3-0.1`) appears at the right of the top bar on GNOME with the AppIndicator extension; its menu mutes, shows or hides the voice pane, and quits, and `HERDR_VOICE_ORB=0` turns it off.
 
 **Pane keys**
 

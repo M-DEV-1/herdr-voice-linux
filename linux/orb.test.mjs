@@ -4,6 +4,7 @@ import { once } from "node:events";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { orbAvailable } from "./orb-link.mjs";
 
 const ORB = join(dirname(fileURLToPath(import.meta.url)), "orb.js");
 const MENU = { mute: 2, pane: 3, quit: 5 };
@@ -14,7 +15,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // Needs gjs, the AppIndicator typelib and a session bus with a StatusNotifierWatcher, so it is skipped elsewhere.
 function trayAvailable() {
   try {
-    execFileSync("gjs", ["-c", "imports.gi.versions.AyatanaAppIndicator3='0.1'; imports.gi.AyatanaAppIndicator3"], { stdio: "ignore" });
+    if (!orbAvailable()) return false;
     busctl("call", "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher", "org.freedesktop.DBus.Properties", "Get", "ss", "org.kde.StatusNotifierWatcher", "RegisteredStatusNotifierItems");
     return true;
   } catch {
