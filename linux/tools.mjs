@@ -131,19 +131,23 @@ export class ConfirmGate {
     return null;
   }
 
-  // Feed every user transcript here. The first transcript at least minDelay after the request decides: a clear yes with no "no" confirms, anything else drops the request.
+  // Feed every piece of user transcript here as it arrives. The first piece at least minDelay after the request decides: a clear yes with no "no" confirms, anything else drops the request. A later piece with a "no" still cancels a yes that has not been used yet.
   heard(transcript) {
     const p = this.pending;
-    if (!p || p.answered) return;
+    if (!p) return;
     const age = this.now() - p.at;
     if (age < this.minDelay) return;
     if (age >= this.ttl) { this.pending = null; return; }
-    p.answered = true;
     const text = transcript.toLowerCase();
     const words = new Set(text.split(/[^\p{L}']+/u));
     const has = (list) => list.some((w) => words.has(w));
     // ponytail: English keyword heuristic; a "no" anywhere cancels, so mixed answers fail safe.
     const no = has(["no", "nope", "don't", "cancel", "stop", "wait", "never", "not"]);
+    if (p.answered) {
+      if (no) this.pending = null; // an answered request that is still pending was a yes
+      return;
+    }
+    p.answered = true;
     const yes = has(["yes", "yeah", "yep", "yup", "sure", "confirm", "confirmed", "correct", "affirmative", "ok", "okay", "approve", "approved", "allow", "accept"]) || text.includes("go ahead");
     p.confirmed = yes && !no;
     if (!p.confirmed) this.pending = null;
@@ -308,17 +312,19 @@ function defaultRunHerdr(env) {
   });
 }
 
-// bash -c with stdin closed and stdout+stderr merged, in its own process group so a timeout stops the children too. Keeps only the last SHELL_OUTPUT_LIMIT characters.
-function shellExec(command, cwd) {
+// bash -c with stdin closed and stdout+stderr merged, in its own process group so a timeout stops the children too. Keeps only the last SHELL_OUTPUT_LIMIT characters. The group's pid is in `groups` while it runs.
+function shellExec(command, cwd, groups) {
   return new Promise((resolve) => {
     const p = spawn("bash", ["-c", command], { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     let tail = "";
     let timedOut = false;
     let done = false;
     const kill = (signal) => { try { process.kill(-p.pid, signal); } catch {} };
+    groups.add(p.pid);
     const finish = (status) => {
       if (done) return;
       done = true;
+      groups.delete(p.pid);
       clearTimeout(timer);
       resolve({ status, output: tail.slice(-SHELL_OUTPUT_LIMIT), timedOut });
     };
@@ -335,10 +341,19 @@ function shellExec(command, cwd) {
 // ---------- tools ----------
 
 // Input: emit(text) for messages the tools send to the model on their own; env for HERDR_* and HERDR_VOICE_SHELL; runHerdr(args, signal) -> Promise<stdout+stderr> and gate for tests.
-// Output: { declarations, run(name, args) -> Promise<{ output } | { error }>, heard(transcript), speechStarted(), stop() }.
+// Output: { declarations, run(name, args) -> Promise<{ output } | { error }>, heard(transcript), speechStarted(), pendingAction(), stop() -> Promise }.
 export function createTools({ emit, env = process.env, runHerdr, gate = new ConfirmGate() }) {
   const abort = new AbortController();
-  const herdr = (args) => (runHerdr ?? (runHerdr = defaultRunHerdr(env)))(args, abort.signal);
+  // Promises of the herdr commands and shell commands still running, so stop() can wait for them to end.
+  const running = new Set();
+  const shellGroups = new Set();
+  const track = (promise) => {
+    running.add(promise);
+    const forget = () => running.delete(promise);
+    promise.then(forget, forget);
+    return promise;
+  };
+  const herdr = (args) => track((runHerdr ?? (runHerdr = defaultRunHerdr(env)))(args, abort.signal));
   const shell = env.HERDR_VOICE_SHELL === "1";
   const busyAgents = new Set();
   const watchedPanes = new Set();
@@ -627,7 +642,8 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
       if (!(() => { try { return statSync(dir).isDirectory(); } catch { return false; } })()) return `error: ${dir} is not a directory`;
       const stop = await confirmStep("run_shell", `run_shell:${dir}:${command}`, `run this command in ${dir}: ${command}`, a.confirmed === true);
       if (stop) return stop;
-      const r = await shellExec(command, dir);
+      if (stopped) return "error: herdr-voice is closing";
+      const r = await track(shellExec(command, dir, shellGroups));
       return `${r.timedOut ? `timed out after ${SHELL_TIMEOUT_MS / 1000} s and was stopped` : `exit ${r.status}`}\n${untrusted(r.output || "(no output)")}`;
     },
 
@@ -788,7 +804,15 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
     // Call when the provider hears the developer start speaking. A tool call made after a [herdr] report with no speech since is treated as the model acting on that report.
     speechStarted() { lastSpeechStart = ++tick; },
 
-    // Stops the background watches: kills their herdr processes and silences any report still on its way.
-    stop() { stopped = true; abort.abort(); },
+    // The action waiting for the developer's yes, if any. The voice uses it to let a run_shell question read the command aloud.
+    pendingAction: () => gate.pending?.action,
+
+    // Stops the background watches and any run_shell command (its whole process group), silences any report still on its way, and resolves once those processes have ended.
+    stop() {
+      stopped = true;
+      abort.abort();
+      for (const pid of shellGroups) { try { process.kill(-pid, "SIGKILL"); } catch {} }
+      return Promise.allSettled([...running]);
+    },
   };
 }

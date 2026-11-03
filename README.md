@@ -51,7 +51,7 @@ These and the other `HERDR_VOICE_*` settings can be exported in the environment 
 **Echo cancellation**
 
 Without echo cancellation the microphone hears the voice, so use headphones or set up a PipeWire echo-cancel pair.
-herdr-voice records from the PipeWire source named `june_ec_source` and plays to the sink named `june_ec_sink` when `pactl list short sources` and `pactl list short sinks` list them, and otherwise uses the default devices.
+herdr-voice records from the PipeWire source named `june_ec_source` and plays to the sink named `june_ec_sink` when `pactl list sources` and `pactl list sinks` list them. If they are not there it uses the first source and sink made by PipeWire's echo-cancel module (their `node.group` property starts with `echo-cancel-`), and otherwise the default devices.
 To get those names, save this as `~/.config/pipewire/pipewire.conf.d/99-echo-cancel.conf` and restart PipeWire (`systemctl --user restart pipewire pipewire-pulse wireplumber`):
 
 ```conf

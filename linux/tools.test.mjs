@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { ConfirmGate, agentName, condense, createTools, focusTargets, resolveFocus, untrusted } from "./tools.mjs";
 
@@ -276,4 +279,34 @@ test("unknown tools and bad JSON come back as errors, never throw", async () => 
   const { tools } = setup();
   assert.deepEqual(await tools.run("nope", {}), { error: "unknown tool nope" });
   assert.match((await tools.run("answer_agent", '{"target":"x","key":"q"}')).error, /not allowed/);
+});
+
+test("a no in a later piece of speech cancels a yes that has not been used yet", async () => {
+  const { tools } = setup();
+  await tools.run("close_tab", { target: "scratch" });
+  tools.heard("yes");
+  tools.heard("yes, no wait");
+  assert.match((await tools.run("close_tab", { target: "scratch", confirmed: true })).output, /^NOT DONE/);
+});
+
+test("stop() kills a running run_shell command with its children", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "herdr-voice-"));
+  const { tools } = setup({}, { env: { ...ENV, HERDR_VOICE_SHELL: "1" } });
+  const args = { command: "sleep 60 & echo $! > child.pid; wait", cwd: dir };
+  await tools.run("run_shell", args);
+  tools.heard("yes");
+  const finished = tools.run("run_shell", { ...args, confirmed: true });
+  const pidFile = join(dir, "child.pid");
+  await until(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim());
+  const pid = Number(readFileSync(pidFile, "utf8"));
+  const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  try {
+    assert.equal(alive(), true);
+    const stopped = tools.stop();
+    await until(() => !alive());
+    assert.equal(alive(), false);
+    await Promise.all([stopped, finished]);
+  } finally {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+  }
 });
