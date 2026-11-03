@@ -2,10 +2,13 @@
 // createTools returns the tool declarations, run(name, args), the confirmation hooks heard() and speechStarted(), and stop().
 import { execFile, spawn } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
+import { connect } from "node:net";
 import { homedir } from "node:os";
-import { basename } from "node:path";
+import { basename, join } from "node:path";
 
 const REPORT_LINES = 20;
+// The most lines read_pane returns, enough for a TLDR of a long agent session.
+const READ_LIMIT = 300;
 const WATCH_LINES = 15;
 const START_TIMEOUT_MS = 60_000;
 const SHELL_TIMEOUT_MS = 60_000;
@@ -25,11 +28,12 @@ const ASK_IF_TOLD = " If it answers CONFIRMATION REQUIRED, ask the developer and
 const focusField = { type: "boolean", description: "Switch the view to it; default false" };
 const directionField = { type: "string", enum: ["right", "down"], description: "Where the new pane goes: right (side by side) or down (below); default right" };
 const paneDirection = { type: "string", enum: ["left", "right", "up", "down"] };
-const paneTarget = str("Pane, by ID, agent name or title");
+const paneTarget = str('Pane as the developer said it: its name, agent name, title, or its tab or workspace name; an ID; or "this" for the focused pane');
+const linesField = { type: "integer", description: `Meaningful lines to return: default ${REPORT_LINES}, 150 for a TLDR or summary of what happened, at most ${READ_LIMIT}` };
 
 const closeSchema = (name, description) => fn(name,
   description + ASK,
-  { target: str("Workspace or tab name or ID as the developer said it"), confirmed: confirmedField },
+  { target: str('Workspace or tab name or ID as the developer said it, or "this" for the focused one'), confirmed: confirmedField },
   ["target"]);
 
 const shellSchemas = [
@@ -44,12 +48,11 @@ const schemas = [
   fn("list_agents", "List coding agents running in Herdr panes with name, status, cwd and title.", {}),
   fn("prompt_agent", "Send an instruction to a coding agent. Returns once the agent starts working." + ASK_IF_TOLD,
     { target: str("Agent name or pane_id from list_agents"), text: str("The instruction for the agent"), confirmed: confirmedField }, ["target", "text"]),
-  fn("read_agent", "Read the agent's recent terminal output.",
-    { target: str("Agent name or pane_id"), lines: { type: "integer", description: "Meaningful lines to return, default 20; ask for more only if needed" } }, ["target"]),
+  fn("read_agent", "Read an agent's recent terminal output.", { target: paneTarget, lines: linesField }, ["target"]),
   fn("answer_agent", "Press a key in an agent's approval or question dialog, only after the developer said what to answer. Approving keys (enter, y, digits) need the developer's yes." + ASK,
     { target: str("Agent name or pane_id"), key: { type: "string", enum: ALLOWED_KEYS, description: "Key to press" }, confirmed: confirmedField }, ["target", "key"]),
-  fn("focus", "Bring a workspace (space), tab or agent pane into view in Herdr, e.g. \"switch to forge\" or \"show me claude-2\".",
-    { target: str("Workspace, tab or agent name or ID as the developer said it") }, ["target"]),
+  fn("focus", "Bring a workspace (space), tab, pane or agent into view in Herdr, e.g. \"go to forge\", \"open the api pane\", \"show me claude-2\".",
+    { target: str("The name as the developer said it, e.g. \"api pane\", or an ID") }, ["target"]),
   closeSchema("close_workspace", "Close a Herdr workspace (space) and every pane in it, stopping its agents."),
   closeSchema("close_tab", "Close a Herdr tab and every pane in it, stopping its agents."),
   closeSchema("remove_worktree", "Remove a git worktree checkout that is open as a Herdr workspace; deletes the checkout directory. Refuses if it has uncommitted changes."),
@@ -72,7 +75,7 @@ const schemas = [
   fn("open_worktree", "Open an existing git worktree of a workspace's repository as a workspace.",
     { workspace: str("Workspace name or ID of the repository"), branch: str("The worktree's branch"), focus: focusField, confirmed: confirmedField }, ["workspace", "branch"]),
 
-  fn("start_agent", "Start a Claude Code or Codex agent somewhere new in one step: next to an existing pane (give split, and direction right or down), in a new git worktree (give workspace and branch), in a new tab of a workspace (give workspace only), or in a new workspace (no workspace; give cwd and/or label). Optionally give it a first instruction. Takes up to a minute while the agent starts.",
+  fn("start_agent", "Only when the developer asks to start, run or launch a new Claude Code or Codex agent (\"open\" something means focus): start it somewhere new in one step: next to an existing pane (give split, and direction right or down), in a new git worktree (give workspace and branch), in a new tab of a workspace (give workspace only), or in a new workspace (no workspace; give cwd and/or label). Optionally give it a first instruction. Takes up to a minute while the agent starts.",
     { kind: { type: "string", enum: AGENT_KINDS, description: "claude for Claude Code, codex for Codex" },
       split: str("Pane or agent to split, by ID, agent name or title; the agent starts in the new pane"), direction: directionField,
       workspace: str("Workspace name or ID: the repository for a new worktree, or where to add a tab"),
@@ -85,8 +88,7 @@ const schemas = [
 
   fn("list_panes", "List every terminal pane, not just agents: ID, workspace, tab, folder, title (usually the running command) and agent if any. Use it to find a dev server, build or log pane.",
     { workspace: str("Only panes in this workspace (name or ID)") }),
-  fn("read_pane", "Read the recent output of any pane, e.g. to tell whether a dev server is up or a build passed.",
-    { target: str("Pane ID, or the pane's title, agent name, tab or workspace name"), lines: { type: "integer", description: "Meaningful lines to return, default 20" } }, ["target"]),
+  fn("read_pane", "Read the recent output of any pane, e.g. for a TLDR, or to tell whether a dev server is up or a build passed.", { target: paneTarget, lines: linesField }, ["target"]),
   fn("watch_pane", "Watch a pane in the background and report when its latest output shows some text, e.g. \"tell me when the build prints done\". Returns at once; a [herdr] message arrives when it matches or times out. If the latest output already shows it, that is reported right away.",
     { target: str("Pane ID, or the pane's title, agent name, tab or workspace name"), text: str("Text to wait for, case-insensitive"),
       regex: str("A regular expression instead of text"), minutes: { type: "integer", description: "Give up after this long; default 10, at most 120" } }, ["target"]),
@@ -222,62 +224,119 @@ export function trimAgents(json) {
   })));
 }
 
-// Workspaces, tabs and agents from one `herdr api snapshot`, as { kind, id, label, detail }.
-export function focusTargets(snapshotJson) {
+// ---------- names: what the developer calls workspaces, tabs and panes ----------
+
+// Words that say what kind of thing is meant; they are dropped from a spoken name and only break ties.
+const KIND_WORDS = { workspace: ["workspace", "workspaces", "space", "spaces"], tab: ["tab", "tabs"], pane: ["pane", "panes", "agent", "agents", "terminal", "window"] };
+const FILLER = new Set([...Object.values(KIND_WORDS).flat(), "the", "a", "an", "my", "one", "ticket", "tickets"]);
+// A spoken name made only of these (and filler) means the focused one.
+const THIS = new Set(["this", "current", "focused", "here", "active"]);
+const LABEL_LIMIT = 40;
+
+// Input: any name or spoken phrase. Output: its lowercase words, without punctuation.
+const nameWords = (s) => String(s ?? "").toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+
+// True when a and b differ by at most one added, dropped or changed letter.
+function nearly(a, b) {
+  if (Math.abs(a.length - b.length) > 1) return false;
+  let i = 0;
+  while (i < a.length && a[i] === b[i]) i++;
+  return a.slice(i + 1) === b.slice(i + 1) || a.slice(i) === b.slice(i + 1) || a.slice(i + 1) === b.slice(i);
+}
+
+// A loose match: every spoken word starts a word of the name or is one slip away from it, or the spoken words run together inside the name ("hv test" in "hvtest").
+const looseMatch = (said, name) => said.every((w) => name.some((n) => n.startsWith(w) || (w.length >= 4 && nearly(w, n)))) || name.join("").includes(said.join(""));
+
+// Input: one `herdr api snapshot` and the voice's own pane ID. Output: { targets, focused }.
+// targets lists every workspace, tab and pane as { kind, id, label, names, workspace, where, lands, focused }, plus detail for workspaces and tabs, and tab, self, title, cwd, agent and status for panes. `lands` is the pane that ends up in view: a pane itself, a tab's focused pane, a workspace's active tab's focused pane, or the only pane inside.
+// focused holds the focused workspace, tab and pane IDs.
+export function herdrState(snapshotJson, selfPane) {
   const snap = parse(snapshotJson)?.result?.snapshot ?? {};
   const list = (key) => (Array.isArray(snap[key]) ? snap[key] : []);
+  const panes = list("panes").filter((p) => p.pane_id);
+  const agents = new Map(list("agents").filter((a) => a.pane_id).map((a) => [a.pane_id, a]));
+  const tabPane = new Map(list("layouts").map((l) => [l.tab_id, l.focused_pane_id]));
+  const onlyPane = (key, id) => { const inside = panes.filter((p) => p[key] === id); return inside.length === 1 ? inside[0].pane_id : undefined; };
+  const wsLabel = new Map(list("workspaces").map((w) => [w.workspace_id, w.label ?? w.workspace_id]));
+  const names = (...n) => n.filter((x) => x !== undefined && x !== null && x !== "").map(String);
   const detail = (r) => `${r.pane_count ?? 0} panes, agents ${r.agent_status ?? "none"}`;
-  return [
-    ...list("agents").filter((r) => r.name ?? r.pane_id).map((r) => ({ kind: "agent", id: r.name ?? r.pane_id, label: r.name ?? r.pane_id, detail: "" })),
-    ...list("workspaces").filter((r) => r.workspace_id).map((r) => ({ kind: "workspace", id: r.workspace_id, label: r.label ?? r.workspace_id, detail: detail(r) })),
-    ...list("tabs").filter((r) => r.tab_id).map((r) => ({ kind: "tab", id: r.tab_id, label: r.label ?? r.tab_id, detail: detail(r) })),
+  const targets = [
+    ...list("workspaces").filter((w) => w.workspace_id).map((w) => ({
+      kind: "workspace", id: w.workspace_id, label: w.label ?? w.workspace_id, names: names(w.label, w.number), workspace: w.workspace_id, where: "",
+      lands: tabPane.get(w.active_tab_id) ?? onlyPane("workspace_id", w.workspace_id), detail: detail(w), focused: w.focused === true,
+    })),
+    ...list("tabs").filter((t) => t.tab_id).map((t) => ({
+      kind: "tab", id: t.tab_id, label: t.label ?? t.tab_id, names: names(t.label, t.number), workspace: t.workspace_id ?? "", where: wsLabel.get(t.workspace_id) ?? "",
+      lands: tabPane.get(t.tab_id) ?? onlyPane("tab_id", t.tab_id), detail: detail(t), focused: t.focused === true,
+    })),
+    ...panes.map((p) => {
+      const agent = agents.get(p.pane_id), name = agent?.name, title = p.terminal_title_stripped ?? "", folder = basename(p.cwd ?? "");
+      // A title with a path in it is a shell showing its folder, so the pane is called by the folder instead.
+      const shown = /[~/]/.test(title) ? `shell in ${folder}` : title;
+      return {
+        kind: "pane", id: p.pane_id, label: (p.label || name || shown || folder).slice(0, LABEL_LIMIT), names: names(p.label, name, title, p.agent),
+        workspace: p.workspace_id ?? "", where: wsLabel.get(p.workspace_id) ?? "", tab: p.tab_id ?? "", lands: p.pane_id, focused: p.focused === true,
+        self: p.pane_id === selfPane, title, cwd: p.cwd ?? "", agent: name ?? p.agent ?? "", status: p.agent ? p.agent_status ?? agent?.agent_status ?? "" : "",
+      };
+    }),
   ];
+  const focusedId = (kind, key) => snap[key] ?? targets.find((t) => t.kind === kind && t.focused)?.id;
+  return { targets, focused: { workspace: focusedId("workspace", "focused_workspace_id"), tab: focusedId("tab", "focused_tab_id"), pane: focusedId("pane", "focused_pane_id") } };
 }
 
-// Exact (case-insensitive) name or ID beats substring; within a pass, agents beat workspaces beat tabs. Returns { hit } or { fail } with the text for the model.
-export function resolveFocus(query, targets) {
-  const q = query.toLowerCase().trim();
-  if (!q) return { fail: "error: say which workspace, tab or agent" };
-  const passes = [(t) => t.id.toLowerCase() === q || t.label.toLowerCase() === q, (t) => t.label.toLowerCase().includes(q)];
-  for (const matches of passes) {
-    for (const kind of ["agent", "workspace", "tab"]) {
-      const hits = targets.filter((t) => t.kind === kind && matches(t));
-      if (hits.length === 1) return { hit: hits[0] };
-      if (hits.length > 1) return { fail: `ambiguous ${kind}: ${hits.map((t) => `${t.label} (${t.id})`).join(", ")}; ask which one` };
+// Finds what the developer named. Input: the name as said, herdrState's result, and options: kinds to search (default all) and pane=true to land on a pane.
+// An exact ID wins, then a name equal to what was said (without filler words), then a loose match. Several matches narrow to the kind named ("the api tab"), then to the focused workspace. "this pane", "this tab" or "the current one" means the focused one, never the voice's own pane.
+// Output: { hit } with the target, or { fail } with one sentence for the model.
+export function resolveTarget(said, state, { kinds = ["workspace", "tab", "pane"], pane = false } = {}) {
+  const raw = String(said ?? "").trim();
+  if (!raw) return { fail: "error: say which one" };
+  const spoken = nameWords(raw);
+  const query = spoken.filter((w) => !FILLER.has(w) && !THIS.has(w));
+  const hint = Object.keys(KIND_WORDS).find((k) => kinds.includes(k) && spoken.some((w) => KIND_WORDS[k].includes(w)));
+  const pool = state.targets.filter((t) => kinds.includes(t.kind));
+  const byId = new Map(state.targets.map((t) => [t.id, t]));
+  const narrow = (list, keep) => (list.filter(keep).length ? list.filter(keep) : list);
+  const tiers = [
+    (t) => t.id.toLowerCase() === raw.toLowerCase(),
+    (t) => t.names.some((n) => { const w = nameWords(n).join(" "); return w === spoken.join(" ") || (query.length > 0 && w === query.join(" ")); }),
+    (t) => query.length > 0 && t.names.some((n) => looseMatch(query, nameWords(n))),
+  ];
+  for (const tier of tiers) {
+    let hits = pool.filter(tier);
+    if (!hits.length) continue;
+    if (hint) hits = narrow(hits, (t) => t.kind === hint);
+    hits = narrow(hits, (t) => t.workspace === state.focused.workspace);
+    if (pane) {
+      const crowded = hits.find((t) => !byId.has(t.lands));
+      hits = hits.map((t) => byId.get(t.lands)).filter(Boolean);
+      if (!hits.length) return { fail: `error: ${crowded.label} has several panes; say which one` };
     }
-  }
-  const named = targets.filter((t) => t.kind !== "tab");
-  const known = (named.length ? named : targets).map((t) => (named.length ? t.label : `${t.label} (${t.id})`)).join(", ");
-  return { fail: `error: nothing named ${query}; known: ${known}` };
-}
-
-// Every pane of a snapshot. A pane is known by its title, else its agent, else its folder.
-export function paneRows(snapshotJson) {
-  const snap = parse(snapshotJson)?.result?.snapshot ?? {};
-  const names = new Map((snap.agents ?? []).filter((a) => a.pane_id && a.name).map((a) => [a.pane_id, a.name]));
-  return (snap.panes ?? []).filter((p) => p.pane_id).map((p) => {
-    const row = { id: p.pane_id, workspace: p.workspace_id ?? "", tab: p.tab_id ?? "", title: p.terminal_title_stripped ?? "", cwd: p.cwd ?? "",
-      agent: names.get(p.pane_id) ?? p.agent ?? "", focused: p.focused ?? false };
-    return { ...row, label: row.title || row.agent || basename(row.cwd) };
-  });
-}
-
-// Exact ID, agent name or title first; then a title containing the words; then a workspace or tab by name, if it holds one pane. Ambiguity goes back to the model to ask.
-export function resolvePane(query, paneList, snapshotJson) {
-  const q = query.toLowerCase().trim();
-  if (!q) return { fail: "error: say which pane" };
-  const places = focusTargets(snapshotJson).filter((t) => t.kind !== "agent");
-  const passes = [
-    (r) => r.id.toLowerCase() === q || r.agent.toLowerCase() === q || r.title.toLowerCase() === q,
-    (r) => r.title.toLowerCase().includes(q),
-    (r) => places.some((t) => (t.id === r.workspace || t.id === r.tab) && (t.label.toLowerCase() === q || t.id.toLowerCase() === q)),
-  ];
-  for (const matches of passes) {
-    const hits = paneList.filter(matches);
+    hits = hits.filter((t, i) => hits.findIndex((o) => (o.lands ?? o.id) === (t.lands ?? t.id)) === i);
     if (hits.length === 1) return { hit: hits[0] };
-    if (hits.length > 1) return { fail: `ambiguous pane: ${hits.map((r) => `${r.label} (${r.id})`).join(", ")}; ask which one` };
+    const shown = hits.slice(0, 6).map((t) => `${t.kind} ${t.label} (${t.id})${t.where ? ` in ${t.where}` : ""}`).join(", ");
+    return { fail: `ambiguous: ${shown}; say these in one sentence and ask which` };
   }
-  return { fail: `error: no pane matches ${query}; call list_panes` };
+  if (!query.length) {
+    const kind = pane ? "pane" : hint ?? ["pane", "tab", "workspace"].find((k) => kinds.includes(k));
+    const t = byId.get(state.focused[kind]);
+    if (!t) return { fail: `error: no ${kind} is focused; say which one` };
+    if (t.self) return { fail: "error: the focused pane is herdr-voice itself; it is never closed or read this way, so say which pane" };
+    return { hit: t };
+  }
+  const known = [...new Set(pool.filter((t) => t.kind === "workspace" || t.workspace === state.focused.workspace).map((t) => t.label))].slice(0, 25).join(", ");
+  return { fail: `error: nothing named ${raw}; there are: ${known}` };
+}
+
+// The model's picture of Herdr: every workspace with its tabs and panes, names and IDs only, marking what is focused and the voice's own pane. Terminal titles come from programs, so the list is fenced as untrusted.
+export function describeState({ targets, focused }) {
+  const mark = (t) => (focused[t.kind] === t.id ? " (focused)" : "");
+  const pane = (p) => `pane "${p.label}" [${p.id}]${p.self ? " herdr-voice itself" : ""}${p.status ? ` agent ${p.agent} ${p.status}` : ""}${mark(p)}`;
+  const lines = targets.filter((t) => t.kind === "workspace").flatMap((w) => [
+    `workspace "${w.label}" [${w.id}]${mark(w)}`,
+    ...targets.filter((t) => t.kind === "tab" && t.workspace === w.id).map((t) =>
+      `  tab "${t.label}" [${t.id}]${mark(t)}: ${targets.filter((p) => p.kind === "pane" && p.tab === t.id).map(pane).join("; ")}`),
+  ]);
+  return `[state] Herdr right now. Don't reply to this; use it for names, and for "this", which means the focused one.\n${untrusted(lines.join("\n"))}`;
 }
 
 // What a create call made, e.g. "; workspace forge-fix (w3C), tab 1 (w3C:t1)", so follow-up calls can use the IDs.
@@ -315,15 +374,48 @@ export function herdrBinary(env) {
   return "herdr";
 }
 
-// Runs `herdr <args>` and returns stdout+stderr.
+// The herdr server's socket: the running session's (HERDR_SOCKET_PATH), else the default session's.
+const socketPath = (env) => env.HERDR_SOCKET_PATH || join(homedir(), ".config", "herdr", "herdr.sock");
+
+// Sends one request to herdr's socket API. Output: the reply line, shaped like the CLI's JSON.
+function socketRequest(env, method, params, signal) {
+  return new Promise((resolve) => {
+    const s = connect(socketPath(env));
+    let reply = "";
+    const done = (out) => { s.destroy(); resolve(out); };
+    s.on("connect", () => s.write(`${JSON.stringify({ id: "herdr-voice", method, params })}\n`));
+    s.on("data", (d) => { reply += d; if (reply.includes("\n")) done(reply.slice(0, reply.indexOf("\n"))); });
+    s.on("error", (e) => done(JSON.stringify({ error: { message: `herdr socket: ${e.message}` } })));
+    signal?.addEventListener("abort", () => done(""), { once: true });
+  });
+}
+
+// The events after which the model's picture of Herdr may be out of date.
+const STATE_EVENTS = ["workspace.created", "workspace.updated", "workspace.renamed", "workspace.closed", "workspace.focused", "tab.created", "tab.closed", "tab.focused", "tab.renamed", "tab.moved",
+  "pane.created", "pane.closed", "pane.updated", "pane.focused", "pane.moved", "pane.exited", "pane.agent_detected", "layout.updated"];
+
+// Calls onChange on every STATE_EVENTS event from herdr. Output: a function that stops watching.
+// ponytail: no reconnect; if the herdr server restarts, the picture stops updating until herdr-voice restarts.
+function watchHerdr(env, onChange) {
+  const s = connect(socketPath(env));
+  s.on("connect", () => s.write(`${JSON.stringify({ id: "herdr-voice-watch", method: "events.subscribe", params: { subscriptions: STATE_EVENTS.map((type) => ({ type })) } })}\n`));
+  s.on("data", (d) => { if (String(d).includes('"event"')) onChange(); });
+  s.on("error", () => {});
+  return () => s.destroy();
+}
+
+// Runs `herdr <args>` and returns stdout+stderr. herdr 0.9's CLI cannot focus a pane by ID, so `pane focus <id>` goes to the socket API.
 function defaultRunHerdr(env) {
   const bin = herdrBinary(env);
-  return (args, signal) => new Promise((resolve) => {
-    execFile(bin, args, { signal, maxBuffer: 1 << 24 }, (err, stdout, stderr) => {
-      if (err?.code === "ENOENT") resolve(JSON.stringify({ error: { message: `could not run ${bin} ${args[0] ?? ""}: ${err.message}` } }));
-      else resolve(stdout + stderr);
+  return (args, signal) => {
+    if (args[0] === "pane" && args[1] === "focus" && args.length === 3) return socketRequest(env, "pane.focus", { pane_id: args[2] }, signal);
+    return new Promise((resolve) => {
+      execFile(bin, args, { signal, maxBuffer: 1 << 24 }, (err, stdout, stderr) => {
+        if (err?.code === "ENOENT") resolve(JSON.stringify({ error: { message: `could not run ${bin} ${args[0] ?? ""}: ${err.message}` } }));
+        else resolve(stdout + stderr);
+      });
     });
-  });
+  };
 }
 
 // bash -c with stdin closed and stdout+stderr merged, in its own process group so a timeout stops the children too. Keeps only the last SHELL_OUTPUT_LIMIT characters. The group's pid is in `groups` while it runs.
@@ -434,14 +526,16 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
 
   // The last `lines` meaningful lines of an agent's or pane's terminal, condensed and fenced. More is fetched than kept because raw terminal text is mostly padding and spinners.
   async function readText(kind, id, lines) {
-    const keep = clamp(lines, 1, 200);
-    const out = await herdr([kind, "read", id, "--source", "recent", "--lines", String(Math.min(keep * 3, 300))]);
+    const keep = clamp(lines, 1, READ_LIMIT);
+    const out = await herdr([kind, "read", id, "--source", "recent", "--lines", String(keep * 3)]);
     return untrusted(condense(parse(out)?.result?.read?.text ?? out, keep));
   }
   const readAgent = (target, lines) => readText("agent", target, lines);
 
   const snapshot = () => herdr(["api", "snapshot"]);
-  const resolve = async (query, kind) => resolveFocus(query, focusTargets(await snapshot()).filter((t) => t.kind === kind));
+  const state = async () => herdrState(await snapshot(), env.HERDR_PANE_ID);
+  const resolve = async (query, kind) => resolveTarget(query, await state(), { kinds: [kind] });
+  const resolvePane = async (query) => resolveTarget(query, await state(), { pane: true });
 
   // Sends an instruction and waits only until the agent reacts, so the conversation is not blocked on the whole turn.
   async function sendPrompt(target, prompt) {
@@ -560,9 +654,8 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
       return perform(tool, ["agent", "rename", target, name], `rename agent ${target} to ${name}`, a, user);
     }
 
-    const snap = await snapshot();
-    const paneList = paneRows(snap);
-    const find = (query) => resolvePane(query ?? "", paneList, snap);
+    const now = await state();
+    const find = (query) => resolveTarget(query, now, { pane: true });
     const found = find(text(a, "target"));
     if (found.fail) return found.fail;
     const p = found.hit;
@@ -649,7 +742,6 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
       return sendPrompt(target, prompt);
     },
 
-    read_agent: (a) => readAgent(a.target ?? "", Number.isInteger(a.lines) ? a.lines : REPORT_LINES),
 
     async answer_agent(a, user) {
       const target = a.target ?? "";
@@ -665,7 +757,7 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
 
     // Resolves a spoken name and focuses it; ambiguity is returned to the model instead of guessing.
     async focus(a) {
-      const r = resolveFocus(a.target ?? "", focusTargets(await snapshot()));
+      const r = resolveTarget(a.target, await state());
       if (r.fail) return r.fail;
       const out = await herdr([r.hit.kind, "focus", r.hit.id]);
       return out.includes('"error"') ? out : `focused ${r.hit.kind} ${r.hit.label}`;
@@ -711,8 +803,7 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
       let create, place;
       if (text(a, "split")) {
         if (text(a, "branch")) return "error: give either split or a new worktree's branch, not both";
-        const snap = await snapshot();
-        const p = resolvePane(text(a, "split"), paneRows(snap), snap);
+        const p = await resolvePane(text(a, "split"));
         if (p.fail) return p.fail;
         const direction = splitDirection(text(a, "direction"));
         if (!direction) return "error: direction must be right or down";
@@ -753,26 +844,26 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
     },
 
     async list_panes(a) {
-      const snap = await snapshot();
-      let shown = paneRows(snap);
+      const now = await state();
+      let shown = now.targets.filter((t) => t.kind === "pane");
       if (text(a, "workspace")) {
-        const w = resolveFocus(text(a, "workspace"), focusTargets(snap).filter((t) => t.kind === "workspace"));
+        const w = resolveTarget(text(a, "workspace"), now, { kinds: ["workspace"] });
         if (w.fail) return w.fail;
         shown = shown.filter((r) => r.workspace === w.hit.id);
       }
       return JSON.stringify(shown.map((r) => ({ id: r.id, workspace: r.workspace, tab: r.tab, title: r.title, folder: r.cwd, agent: r.agent || "none", focused: r.focused })));
     },
 
+    // read_agent does the same: an agent is read through its pane.
     async read_pane(a) {
-      const snap = await snapshot();
-      const p = resolvePane(a.target ?? "", paneRows(snap), snap);
+      const p = await resolvePane(a.target);
       if (p.fail) return p.fail;
+      if (p.hit.self) return "error: that pane is herdr-voice itself; say which pane to read";
       return `pane ${p.hit.label} (${p.hit.id}):\n${await readText("pane", p.hit.id, Number.isInteger(a.lines) ? a.lines : REPORT_LINES)}`;
     },
 
     async watch_pane(a) {
-      const snap = await snapshot();
-      const p = resolvePane(a.target ?? "", paneRows(snap), snap);
+      const p = await resolvePane(a.target);
       if (p.fail) return p.fail;
       let regex, awaited;
       if (text(a, "regex")) {
@@ -791,8 +882,7 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
 
     // split_pane: nothing is destroyed, so it runs at once when the developer asked; see allowed() for when the model acts on an agent report.
     async split_pane(a, user) {
-      const snap = await snapshot();
-      const p = resolvePane(a.target ?? "", paneRows(snap), snap);
+      const p = await resolvePane(a.target);
       if (p.fail) return p.fail;
       const direction = splitDirection(text(a, "direction"));
       if (!direction) return "error: direction must be right or down";
@@ -809,6 +899,7 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
   const via = (names, f) => names.map((n) => [n, (a, user) => f(n, a, user)]);
   const dispatch = {
     ...handlers,
+    read_agent: handlers.read_pane,
     ...Object.fromEntries([
       ...via(["close_workspace", "close_tab", "remove_worktree"], close),
       ...via(["create_workspace", "rename_workspace", "create_tab", "rename_tab", "list_worktrees", "create_worktree", "open_worktree"], manage),
@@ -836,6 +927,12 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
 
     // Call when the provider hears the developer start speaking. A tool call made after a [herdr] report with no speech since is treated as the model acting on that report.
     speechStarted() { lastSpeechStart = ++tick; },
+
+    // The model's picture of Herdr now (see describeState).
+    context: async () => describeState(await state()),
+
+    // Calls onChange whenever herdr's workspaces, tabs or panes change. Output: a function that stops watching.
+    watch: (onChange) => watchHerdr(env, onChange),
 
     // The action waiting for the developer's yes, if any. The voice uses it to let a run_shell question read the command aloud.
     pendingAction: () => gate.pending?.action,
