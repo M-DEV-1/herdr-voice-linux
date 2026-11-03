@@ -6,6 +6,7 @@ import { chmodSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync,
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createTools, herdrBinary } from './tools.mjs';
 
 const PLUGIN_ID = 'brogrammermw.herdr-voice';
 const SELF = realpathSync(fileURLToPath(import.meta.url));
@@ -13,7 +14,8 @@ const ENDPOINT = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativ
 const DEFAULT_MODEL = 'gemini-3.1-flash-live-preview';
 const DEFAULT_VOICE = 'Kore';
 const IN_RATE = 16000;
-const OUT_BYTES_PER_SECOND = 48000;
+const OUT_RATE = 24000;
+const OUT_BYTES_PER_SECOND = OUT_RATE * 2;
 const CHUNK_BYTES = IN_RATE * 2 / 50;
 const OUT_CHUNK_BYTES = OUT_BYTES_PER_SECOND / 50;
 // june_ec_source passes noise up to -37 dBFS in the first 0.5 s after pw-record starts (measured), so the first second of mic audio is dropped.
@@ -45,7 +47,9 @@ export const systemPrompt = (confirm) => `You are the voice of a developer's ter
 you talk with the developer and hand real work to those agents with your tools.
 
 How you speak (this overrides everything else):
-- One or two short sentences per turn, never more. High-level summaries only: what happened and what it means.
+- Answer first, in one or two plain sentences, never more. High-level summaries only: what happened and what it means.
+- Stop after the answer: no closing offers or questions ("anything else?", "want me to...?"), no pleasantries or filler.
+- Give only the details asked for. When you don't know, say so in one sentence.
 - Never read aloud code, file paths, commands, diffs, stack traces, logs, URLs, IDs, or long numbers. \
 Say what they amount to instead: "it fixed the login null check", not the code or the file name.
 - Answer the developer's own questions directly, general ones too, not only Herdr ones.
@@ -56,7 +60,7 @@ names from the code or file paths.
 repeat the developer's request back.
 - Speak up on your own only when an agent finishes, fails, or needs approval: say the outcome, or read the approval \
 question in one sentence and ask what to answer. Otherwise stay quiet until spoken to.
-- If the developer asks for detail, still summarize, and offer to focus the agent's pane so they can read it.
+- If the developer asks for detail, still summarize; focus the agent's pane when they want to read it themselves.
 - This is enforced: your speech is checked as you talk. A reply that runs long gets cut off, and reading code, paths, \
 file names, URLs or diffs aloud gets flagged afterwards. Plan to finish in two sentences.
 
@@ -64,6 +68,9 @@ How you work:
 - Only call a tool that changes something (prompt_agent, answer_agent, run_shell, closing, removing, creating or renaming) \
 when the developer's words clearly ask for that action and name or clearly point to its target. If what you heard is garbled \
 or makes no sense, say you didn't catch it and ask them to say it again; never guess an action.
+- Before saying what an agent or pane is doing or has done (a status, a summary, a TLDR), call read_agent or read_pane \
+and answer from what it returns, never from memory.
+- You can see and act on every workspace, tab and pane in Herdr. Never say you are in, or limited to, one workspace.
 - Call list_agents when you don't know which agent is meant. Pick by name, cwd, or terminal title. \
 If it is still ambiguous, ask.
 - ${confirm ? "Before the first prompt_agent call of the conversation, confirm the target agent. After that, say" : "Say"} in a few words what you are sending, \
@@ -275,7 +282,6 @@ export class GeminiWire {
   hearsActivity = false;
   userText = '';
   assistantText = '';
-  turnNumber = 0;
 
   decode(msg) {
     const events = [];
@@ -345,7 +351,6 @@ export class GeminiWire {
     if (this.modelTurnActive) return;
     this.endUserTurn(events);
     this.modelTurnActive = this.turnHadOutput = true;
-    this.turnNumber++;
     events.push({ t: 'responseCreated' });
   }
 
@@ -683,7 +688,7 @@ class Speaker {
 
   play(pcm) {
     if (!this.proc) {
-      const args = ['--rate', '24000', '--channels', '1', '--format', 's16', ...(this.target ? ['--target', this.target] : []), '-'];
+      const args = ['--rate', String(OUT_RATE), '--channels', '1', '--format', 's16', ...(this.target ? ['--target', this.target] : []), '-'];
       const proc = this.proc = spawn('pw-play', args, { stdio: ['pipe', 'ignore', 'ignore'] });
       proc.stdin.on('error', () => {});
       proc.on('error', (e) => { if (this.proc === proc) { this.proc = null; log(`x pw-play: ${e.message}`); } });
@@ -1156,7 +1161,7 @@ export class Session {
 
 // ---------- commands ----------
 
-const herdr = (args) => spawnSync(process.env.HERDR_BIN_PATH || 'herdr', args, { encoding: 'utf8' });
+const herdr = (args) => spawnSync(herdrBinary(process.env), args, { encoding: 'utf8' });
 const field = (json, ...path) => { try { return path.reduce((o, k) => o?.[k], JSON.parse(json)); } catch { return undefined; } };
 
 // A plain `herdr-voice` inside Herdr opens the plugin's voice pane below the current pane. In that pane, with --here, or outside Herdr, it runs in place.
@@ -1296,7 +1301,6 @@ async function main() {
   if (!process.env.HERDR_VOICE_MIC && !micTarget) log('! no echo cancellation (no echo-cancel source in PipeWire): use headphones or the voice will hear itself');
   if (process.env.HERDR_ENV !== '1') log('! not inside a Herdr pane; herdr commands will target the focused session and close tools are off');
 
-  const { createTools } = await import('./tools.mjs');
   const threshold = Number.parseFloat(process.env.HERDR_VOICE_GATE_THRESHOLD ?? '');
   const echoRatio = Number.parseFloat(process.env.HERDR_VOICE_ECHO_RATIO ?? '');
   session = new Session({

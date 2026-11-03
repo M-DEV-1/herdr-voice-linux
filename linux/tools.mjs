@@ -309,10 +309,15 @@ function uniqueName(name, taken) {
 
 // ---------- processes ----------
 
-// Runs `herdr <args>` and returns stdout+stderr. Uses the running herdr's own binary (HERDR_BIN_PATH) when it is executable, else `herdr` from PATH.
+// The herdr binary to run: the running herdr's own (HERDR_BIN_PATH) when it is executable, else `herdr` from PATH. herdr-voice.mjs uses it too.
+export function herdrBinary(env) {
+  try { if (env.HERDR_BIN_PATH?.startsWith("/")) { accessSync(env.HERDR_BIN_PATH, constants.X_OK); return env.HERDR_BIN_PATH; } } catch {}
+  return "herdr";
+}
+
+// Runs `herdr <args>` and returns stdout+stderr.
 function defaultRunHerdr(env) {
-  let bin = "herdr";
-  try { if (env.HERDR_BIN_PATH?.startsWith("/")) { accessSync(env.HERDR_BIN_PATH, constants.X_OK); bin = env.HERDR_BIN_PATH; } } catch {}
+  const bin = herdrBinary(env);
   return (args, signal) => new Promise((resolve) => {
     execFile(bin, args, { signal, maxBuffer: 1 << 24 }, (err, stdout, stderr) => {
       if (err?.code === "ENOENT") resolve(JSON.stringify({ error: { message: `could not run ${bin} ${args[0] ?? ""}: ${err.message}` } }));
