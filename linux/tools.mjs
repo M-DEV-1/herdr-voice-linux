@@ -19,32 +19,34 @@ const APPROVAL_KEYS = new Set(["enter", "y", ..."123456789"]);
 const str = (description) => ({ type: "string", description });
 const fn = (name, description, properties, required = []) => ({ name, description, parameters: { type: "object", properties, required } });
 const confirmedField = { type: "boolean", description: "true only on the second call, after the developer said yes" };
+// The confirmation step, described only when HERDR_VOICE_CONFIRM=1 (see confirmFree).
+const ASK = " Call without confirmed first, ask the developer, then call again with confirmed=true after they say yes.";
+const ASK_IF_TOLD = " If it answers CONFIRMATION REQUIRED, ask the developer and call again with confirmed=true after they say yes.";
 const focusField = { type: "boolean", description: "Switch the view to it; default false" };
 const directionField = { type: "string", enum: ["right", "down"], description: "Where the new pane goes: right (side by side) or down (below); default right" };
 const paneDirection = { type: "string", enum: ["left", "right", "up", "down"] };
 const paneTarget = str("Pane, by ID, agent name or title");
 
 const closeSchema = (name, description) => fn(name,
-  description + " Call without confirmed first, ask the developer, then call again with confirmed=true after they say yes.",
-  { target: str("Workspace or tab name or ID as the developer said it"),
-    confirmed: { type: "boolean", description: "true only after the developer said yes to the confirmation question" } },
+  description + ASK,
+  { target: str("Workspace or tab name or ID as the developer said it"), confirmed: confirmedField },
   ["target"]);
 
 const shellSchemas = [
-  fn("run_shell", "Run a short shell command (bash, no input, 60 s limit) and get its exit code and output. For quick checks the developer asks for; send real coding work to an agent with prompt_agent instead. Always two calls: call without confirmed, ask the developer, then call again with confirmed=true after they say yes.",
+  fn("run_shell", "Run a short shell command (bash, no input, 60 s limit) and get its exit code and output. For quick checks the developer asks for; send real coding work to an agent with prompt_agent instead." + ASK,
     { command: str("The exact shell command"), cwd: str("Directory to run in, e.g. an agent's cwd. Defaults to herdr-voice's directory"), confirmed: confirmedField },
     ["command"]),
-  fn("run_in_pane", "Type a shell command into a pane and press enter, where the developer can see it run (a dev server, tests). Always two calls: call without confirmed, ask the developer, then call again with confirmed=true after they say yes.",
+  fn("run_in_pane", "Type a shell command into a pane and press enter, where the developer can see it run (a dev server, tests)." + ASK,
     { target: paneTarget, command: str("The exact command"), confirmed: confirmedField }, ["target", "command"]),
 ];
 
 const schemas = [
   fn("list_agents", "List coding agents running in Herdr panes with name, status, cwd and title.", {}),
-  fn("prompt_agent", "Send an instruction to a coding agent. Returns once the agent starts working. If it answers CONFIRMATION REQUIRED, ask the developer and call again with confirmed=true after they say yes.",
+  fn("prompt_agent", "Send an instruction to a coding agent. Returns once the agent starts working." + ASK_IF_TOLD,
     { target: str("Agent name or pane_id from list_agents"), text: str("The instruction for the agent"), confirmed: confirmedField }, ["target", "text"]),
   fn("read_agent", "Read the agent's recent terminal output.",
     { target: str("Agent name or pane_id"), lines: { type: "integer", description: "Meaningful lines to return, default 20; ask for more only if needed" } }, ["target"]),
-  fn("answer_agent", "Press a key in an agent's approval or question dialog, only after the developer said what to answer. Approving keys (enter, y, digits) need the developer's spoken yes: call once, ask, then call again with confirmed=true.",
+  fn("answer_agent", "Press a key in an agent's approval or question dialog, only after the developer said what to answer. Approving keys (enter, y, digits) need the developer's yes." + ASK,
     { target: str("Agent name or pane_id"), key: { type: "string", enum: ALLOWED_KEYS, description: "Key to press" }, confirmed: confirmedField }, ["target", "key"]),
   fn("focus", "Bring a workspace (space), tab or agent pane into view in Herdr, e.g. \"switch to forge\" or \"show me claude-2\".",
     { target: str("Workspace, tab or agent name or ID as the developer said it") }, ["target"]),
@@ -92,7 +94,7 @@ const schemas = [
     { target: str("Pane to split, by ID, agent name or title"), direction: directionField,
       cwd: str("Folder for the new pane; default is the split pane's"), focus: focusField, confirmed: confirmedField }, ["target"]),
 
-  fn("close_pane", "Close one pane, stopping what runs in it. Call without confirmed first, ask the developer, then call again with confirmed=true after they say yes.",
+  fn("close_pane", "Close one pane, stopping what runs in it." + ASK,
     { target: paneTarget, confirmed: confirmedField }, ["target"]),
   fn("zoom_pane", "Zoom a pane to fill its tab, or unzoom it.",
     { target: paneTarget, zoom: { type: "string", enum: ["toggle", "on", "off"], description: "Default toggle" }, confirmed: confirmedField }, ["target"]),
@@ -113,6 +115,13 @@ const schemas = [
   fn("pane_processes", "What programs are running in a pane right now (names only), e.g. to tell if a dev server or build is still running.",
     { target: paneTarget }, ["target"]),
 ];
+
+// Input: a tool declaration. Output: the same tool without the confirmed parameter and the instructions to ask, for HERDR_VOICE_CONFIRM=0.
+const confirmFree = (d) => {
+  const { confirmed, ...properties } = d.parameters.properties;
+  const description = d.description.replace(ASK, "").replace(ASK_IF_TOLD, "").replace(" Approving keys (enter, y, digits) need the developer's yes.", "");
+  return { ...d, description, parameters: { ...d.parameters, properties } };
+};
 
 // ---------- confirmation gate ----------
 
@@ -353,8 +362,27 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
     promise.then(forget, forget);
     return promise;
   };
-  const herdr = (args) => track((runHerdr ?? (runHerdr = defaultRunHerdr(env)))(args, abort.signal));
+  const runRaw = (args) => track((runHerdr ?? (runHerdr = defaultRunHerdr(env)))(args, abort.signal));
+  const only = env.HERDR_VOICE_ONLY_WORKSPACE;
+  const herdr = async (args) => {
+    const why = only && await outside(args);
+    return why ? JSON.stringify({ error: { code: "outside_workspace", message: why } }) : runRaw(args);
+  };
+
+  // HERDR_VOICE_ONLY_WORKSPACE (for testing): the reason a herdr command would touch something outside that workspace, or null. Every workspace, tab, pane and agent the snapshot knows is mapped to its workspace; commands that would make a new workspace or use the focused one are refused too.
+  async function outside(args) {
+    const line = args.join(" ");
+    if (/^(workspace create|worktree (create|open))\b/.test(line) || (line.startsWith("tab create") && !args.includes("--workspace"))) return `only workspace ${only} may be used (HERDR_VOICE_ONLY_WORKSPACE)`;
+    const snap = parse(await runRaw(["api", "snapshot"]))?.result?.snapshot ?? {};
+    const home = new Map([
+      ...(snap.workspaces ?? []).map((w) => [w.workspace_id, w.workspace_id]),
+      ...[...(snap.tabs ?? []), ...(snap.panes ?? []), ...(snap.agents ?? [])].flatMap((x) => [[x.tab_id, x.workspace_id], [x.pane_id, x.workspace_id], [x.name, x.workspace_id]]),
+    ]);
+    const hit = args.slice(1).find((a) => home.has(a) && home.get(a) !== only);
+    return hit ? `${hit} is outside workspace ${only} (HERDR_VOICE_ONLY_WORKSPACE)` : null;
+  }
   const shell = env.HERDR_VOICE_SHELL === "1";
+  const askFirst = env.HERDR_VOICE_CONFIRM === "1";
   const busyAgents = new Set();
   const watchedPanes = new Set();
   // Counters rather than clocks: the model's call counts as the developer's own when speech started after the last [herdr] report.
@@ -369,7 +397,16 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
     emit(`[herdr] ${message}`);
   };
 
-  // Shared two-step flow. Returns the message for the model, or null when the developer confirmed and the caller may act.
+  // Decides whether an action may run now. Returns the message for the model, or null to go ahead.
+  // Without HERDR_VOICE_CONFIRM=1 nothing asks: an action runs when the developer spoke since the last [herdr] report, and is refused when the model took it on its own after a report, so text in agent output can't trigger it.
+  // With HERDR_VOICE_CONFIRM=1 a risky action always waits for a spoken yes, and any other action does when the model took it on its own.
+  async function allowed(tool, action, question, a, user, risky) {
+    if (askFirst) return risky || !user ? confirmStep(tool, action, question, a.confirmed === true) : null;
+    if (user) return null;
+    return `NOT DONE. Nothing happened: ${question} came right after a [herdr] message, with nothing said by the developer since, so it was refused. If it should happen, tell the developer in one sentence and let them say it.`;
+  }
+
+  // Shared two-step flow for HERDR_VOICE_CONFIRM=1. Returns the message for the model, or null when the developer confirmed and the caller may act.
   async function confirmStep(tool, action, question, confirmed) {
     if (!confirmed) {
       const waiting = gate.request(action, question);
@@ -382,12 +419,10 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
     return null;
   }
 
-  // A change that destroys nothing: runs at once when the developer asked, needs a spoken yes when the model acts on an agent report.
+  // A change that destroys nothing: runs at once when the developer asked; see allowed() for when the model acts on an agent report.
   async function perform(tool, command, description, a, user, suffix = () => "") {
-    if (!user) {
-      const stop = await confirmStep(tool, `${tool}:${command.join(" ")}`, description, a.confirmed === true);
-      if (stop) return stop;
-    }
+    const stop = await allowed(tool, `${tool}:${command.join(" ")}`, description, a, user, false);
+    if (stop) return stop;
     const out = await herdr(command);
     return result(out, `done: ${description}${suffix(out)}`);
   }
@@ -444,8 +479,8 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
     })().catch(() => {}).finally(() => watchedPanes.delete(key));
   }
 
-  // close_workspace, close_tab and remove_worktree always need a spoken yes, and never touch the workspace or tab herdr-voice itself runs in.
-  async function close(tool, a) {
+  // close_workspace, close_tab and remove_worktree: risky actions (see allowed()) that never touch the workspace or tab herdr-voice itself runs in.
+  async function close(tool, a, user) {
     // Outside Herdr the self-close guard has no IDs to compare, and commands would hit whichever session is focused, so destructive tools stay off.
     if (env.HERDR_ENV !== "1") return "error: close tools are disabled because herdr-voice is not running inside a Herdr pane";
     const kind = tool === "close_tab" ? "tab" : "workspace";
@@ -461,7 +496,7 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
       description = `remove worktree ${tree.path ?? "?"} on ${tree.branch ?? "detached HEAD"}, open as workspace ${t.label}; this deletes the checkout`;
       command = ["worktree", "remove", "--workspace", t.id]; // never --force: dirty trees must fail
     }
-    const stop = await confirmStep(tool, `${tool}:${t.id}`, description, a.confirmed === true);
+    const stop = await allowed(tool, `${tool}:${t.id}`, description, a, user, true);
     if (stop) return stop;
     const out = await herdr(command);
     return out.includes('"error"') ? failed(out) : `done: ${description}`;
@@ -511,7 +546,6 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
 
   // The rest of Herdr's pane and agent commands: close, zoom, resize, swap, move and rename panes, rename agents, explain agent detection, show what a pane runs, and run a command in a visible pane.
   async function paneControl(tool, a, user) {
-    const confirmed = a.confirmed === true;
     // Agent tools take an agent name or pane ID as Herdr does.
     if (tool === "agent_info") return untrusted(await herdr(["agent", "explain", text(a, "target") ?? ""]));
     if (tool === "rename_agent") {
@@ -543,7 +577,7 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
       case "close_pane": {
         if (env.HERDR_ENV !== "1") return "error: closing is off because herdr-voice isn't running inside Herdr";
         if (isSelf) return "error: that pane is herdr-voice itself; the developer can close it or run herdr-voice stop";
-        const stop = await confirmStep(tool, `${tool}:${p.id}`, `close pane ${p.label} (${p.id})`, confirmed);
+        const stop = await allowed(tool, `${tool}:${p.id}`, `close pane ${p.label} (${p.id})`, a, user, true);
         return stop ?? result(await herdr(["pane", "close", p.id]), `closed pane ${p.label}`);
       }
       case "run_in_pane": {
@@ -551,7 +585,7 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
         const command = text(a, "command");
         if (!command) return "error: say the command";
         if (isSelf) return "error: that pane is herdr-voice itself; pick another pane";
-        const stop = await confirmStep(tool, `${tool}:${p.id}:${command}`, `run ${command} in ${p.label}`, confirmed);
+        const stop = await allowed(tool, `${tool}:${p.id}:${command}`, `run ${command} in ${p.label}`, a, user, true);
         return stop ?? result(await herdr(["pane", "run", p.id, command]), `sent the command to ${p.label} (${p.id}); use read_pane or watch_pane to follow it`);
       }
       case "zoom_pane": {
@@ -605,20 +639,18 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
     async prompt_agent(a, user) {
       const target = typeof a.target === "string" ? a.target : "";
       const prompt = typeof a.text === "string" ? a.text : "";
-      if (!user) {
-        const stop = await confirmStep("prompt_agent", `prompt_agent:${target}:${prompt}`, `send ${target} this instruction: ${prompt}`, a.confirmed === true);
-        if (stop) return stop;
-      }
+      const stop = await allowed("prompt_agent", `prompt_agent:${target}:${prompt}`, `send ${target} this instruction: ${prompt}`, a, user, false);
+      if (stop) return stop;
       return sendPrompt(target, prompt);
     },
 
     read_agent: (a) => readAgent(a.target ?? "", Number.isInteger(a.lines) ? a.lines : REPORT_LINES),
 
-    async answer_agent(a) {
+    async answer_agent(a, user) {
       const target = a.target ?? "";
       if (!ALLOWED_KEYS.includes(a.key)) return `error: key ${a.key ?? ""} not allowed`;
       if (APPROVAL_KEYS.has(a.key)) {
-        const stop = await confirmStep("answer_agent", `answer_agent:${target}:${a.key}`, `press ${a.key} to answer ${target}'s prompt`, a.confirmed === true);
+        const stop = await allowed("answer_agent", `answer_agent:${target}:${a.key}`, `press ${a.key} to answer ${target}'s prompt`, a, user, true);
         if (stop) return stop;
       }
       const out = await herdr(["agent", "send-keys", target, a.key]);
@@ -634,13 +666,13 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
       return out.includes('"error"') ? out : `focused ${r.hit.kind} ${r.hit.label}`;
     },
 
-    async run_shell(a) {
+    async run_shell(a, user) {
       if (!shell) return "error: run_shell is disabled (set HERDR_VOICE_SHELL=1)";
       const command = text(a, "command");
       if (!command) return "error: no command";
       const dir = expand(text(a, "cwd") ?? process.cwd());
       if (!(() => { try { return statSync(dir).isDirectory(); } catch { return false; } })()) return `error: ${dir} is not a directory`;
-      const stop = await confirmStep("run_shell", `run_shell:${dir}:${command}`, `run this command in ${dir}: ${command}`, a.confirmed === true);
+      const stop = await allowed("run_shell", `run_shell:${dir}:${command}`, `run this command in ${dir}: ${command}`, a, user, true);
       if (stop) return stop;
       if (stopped) return "error: herdr-voice is closing";
       const r = await track(shellExec(command, dir, shellGroups));
@@ -698,10 +730,8 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
       const name = uniqueName(text(a, "name") ?? agentName(kind, text(a, "branch") ?? text(a, "label")), taken);
 
       const description = `start ${kind} as ${name} in ${place}${prompt ? ` and tell it: ${prompt}` : ""}`;
-      if (!user) {
-        const stop = await confirmStep("start_agent", `start_agent:${create.join(" ")}:${name}:${prompt ?? ""}`, description, a.confirmed === true);
-        if (stop) return stop;
-      }
+      const stop = await allowed("start_agent", `start_agent:${create.join(" ")}:${name}:${prompt ?? ""}`, description, a, user, false);
+      if (stop) return stop;
 
       const created = await herdr(create);
       const pane = rootPane(created);
@@ -754,7 +784,7 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
       return `watching ${p.hit.label} for ${awaited}, up to ${minutes} minutes; a [herdr] message will say when it shows up. Tell the developer in a few words.`;
     },
 
-    // split_pane: nothing is destroyed, so it runs at once when the developer asked; from an agent report it needs a spoken yes.
+    // split_pane: nothing is destroyed, so it runs at once when the developer asked; see allowed() for when the model acts on an agent report.
     async split_pane(a, user) {
       const snap = await snapshot();
       const p = resolvePane(a.target ?? "", paneRows(snap), snap);
@@ -763,10 +793,8 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
       if (!direction) return "error: direction must be right or down";
       const command = ["pane", "split", p.hit.id, "--direction", direction, a.focus === true ? "--focus" : "--no-focus", ...option("--cwd", cwdOf(a))];
       const description = `split ${p.hit.label} ${direction === "right" ? "to the right" : "down"}`;
-      if (!user) {
-        const stop = await confirmStep("split_pane", `split_pane:${command.join(" ")}`, description, a.confirmed === true);
-        if (stop) return stop;
-      }
+      const stop = await allowed("split_pane", `split_pane:${command.join(" ")}`, description, a, user, false);
+      if (stop) return stop;
       const out = await herdr(command);
       const made = rootPane(out);
       return out.includes('"error"') || !made ? failed(out) : `done: ${description}; the new pane is ${made}`;
@@ -784,7 +812,7 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
   };
 
   return {
-    declarations: shell ? [...schemas, ...shellSchemas] : schemas,
+    declarations: (shell ? [...schemas, ...shellSchemas] : schemas).map(askFirst ? (d) => d : confirmFree),
 
     // Runs one tool call. Whether the call counts as the developer's own is decided when it starts, from speechStarted() and the last [herdr] report.
     async run(name, args) {
