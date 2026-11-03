@@ -65,6 +65,7 @@ The voice does what you ask without asking "shall I?" first, including closing w
 It never closes its own workspace, tab or pane, and never force-removes a worktree with uncommitted changes.
 An action the model takes on its own right after an agent report, with nothing said by you since, is refused, so text in an agent's output can't trigger it; the voice tells you, and you say it if you want it.
 `HERDR_VOICE_CONFIRM=1` brings back the spoken yes before every risky action.
+`HERDR_VOICE_ONLY_WORKSPACE=<workspace id>` is for testing: the voice refuses anything that names a workspace, tab, pane or agent outside that workspace, and refuses to create workspaces.
 
 **Models**
 
