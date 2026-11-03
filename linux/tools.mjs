@@ -10,10 +10,16 @@ const REPORT_LINES = 20;
 // The most lines read_pane returns, enough for a TLDR of a long agent session.
 const READ_LIMIT = 300;
 const WATCH_LINES = 15;
+// The event socket reconnects 0.5 s after it closes, doubling the wait up to 30 s; herdr's picture is fetched once its events pause for 300 ms.
+const WATCH_RETRY_MS = 500;
+const WATCH_RETRY_MAX_MS = 30_000;
+const WATCH_SETTLE_MS = 300;
 const START_TIMEOUT_MS = 60_000;
 const SHELL_TIMEOUT_MS = 60_000;
 const SHELL_OUTPUT_LIMIT = 4000;
 const AGENT_KINDS = ["claude", "codex"];
+// herdr's agent statuses that get a spoken report, and what the report says happened. working and unknown get none.
+const AGENT_PHASES = { idle: "finished", done: "finished", blocked: "needs input" };
 const ALLOWED_KEYS = [..."123456789", "down", "enter", "esc", "n", "tab", "up", "y"];
 const APPROVAL_KEYS = new Set(["enter", "y", ..."123456789"]);
 
@@ -313,8 +319,8 @@ export function resolveTarget(said, state, { kinds = ["workspace", "tab", "pane"
     }
     hits = hits.filter((t, i) => hits.findIndex((o) => (o.lands ?? o.id) === (t.lands ?? t.id)) === i);
     if (hits.length === 1) return { hit: hits[0] };
-    const shown = hits.slice(0, 6).map((t) => `${t.kind} ${t.label} (${t.id})${t.where ? ` in ${t.where}` : ""}`).join(", ");
-    return { fail: `ambiguous: ${shown}; say these in one sentence and ask which` };
+    const shown = hits.slice(0, 6).map((t) => `${t.kind} ${t.label}${t.where ? ` in ${t.where}` : ""} [${t.id}]`).join(", ");
+    return { fail: `ambiguous: ${shown}; say the names and places in one sentence, never the IDs in brackets, and ask which` };
   }
   if (!query.length) {
     const kind = pane ? "pane" : hint ?? ["pane", "tab", "workspace"].find((k) => kinds.includes(k));
@@ -336,7 +342,7 @@ export function describeState({ targets, focused }) {
     ...targets.filter((t) => t.kind === "tab" && t.workspace === w.id).map((t) =>
       `  tab "${t.label}" [${t.id}]${mark(t)}: ${targets.filter((p) => p.kind === "pane" && p.tab === t.id).map(pane).join("; ")}`),
   ]);
-  return `[state] Herdr right now. Don't reply to this; use it for names, and for "this", which means the focused one.\n${untrusted(lines.join("\n"))}`;
+  return `[state] Herdr right now. Don't reply to this; use it for names, and for "this", which means the focused one. IDs in [brackets] are for tool calls only; never say them.\n${untrusted(lines.join("\n"))}`;
 }
 
 // What a create call made, e.g. "; workspace forge-fix (w3C), tab 1 (w3C:t1)", so follow-up calls can use the IDs.
@@ -394,14 +400,57 @@ function socketRequest(env, method, params, signal) {
 const STATE_EVENTS = ["workspace.created", "workspace.updated", "workspace.renamed", "workspace.closed", "workspace.focused", "tab.created", "tab.closed", "tab.focused", "tab.renamed", "tab.moved",
   "pane.created", "pane.closed", "pane.updated", "pane.focused", "pane.moved", "pane.exited", "pane.agent_detected", "layout.updated"];
 
-// Calls onChange on every STATE_EVENTS event from herdr. Output: a function that stops watching.
-// ponytail: no reconnect; if the herdr server restarts, the picture stops updating until herdr-voice restarts.
-function watchHerdr(env, onChange) {
-  const s = connect(socketPath(env));
-  s.on("connect", () => s.write(`${JSON.stringify({ id: "herdr-voice-watch", method: "events.subscribe", params: { subscriptions: STATE_EVENTS.map((type) => ({ type })) } })}\n`));
-  s.on("data", (d) => { if (String(d).includes('"event"')) onChange(); });
-  s.on("error", () => {});
-  return () => s.destroy();
+// Follows herdr's event socket. Input: env, snapshot() resolving to `herdr api snapshot` JSON, onSnapshot(json, started) called with started=true each time the subscription starts and with false once STATE_EVENTS pause for 300 ms, and onStatus(data) for every pane.agent_status_changed event.
+// herdr sends agent changes only for the panes a subscription names, so it names every pane in the snapshot and subscribes again when the snapshot shows other panes.
+// When the socket closes (the herdr server restarted) it reconnects after WATCH_RETRY_MS, doubling up to WATCH_RETRY_MAX_MS until a subscription starts. Output: a function that stops watching.
+function watchHerdr(env, snapshot, onSnapshot, onStatus) {
+  let socket = null, retry = null, settle = null, stopped = false, delay = WATCH_RETRY_MS, subscribed = "";
+  const paneIds = (json) => (parse(json)?.result?.snapshot?.panes ?? []).map((p) => p.pane_id).filter(Boolean);
+  // A failed fetch counts as an empty snapshot, so the socket's own failure drives the retry.
+  const fetch = () => snapshot().catch(() => "");
+
+  async function open() {
+    const json = await fetch();
+    if (stopped) return;
+    const panes = paneIds(json);
+    const s = socket = connect(socketPath(env));
+    const subscriptions = [...STATE_EVENTS.map((type) => ({ type })), ...panes.map((pane_id) => ({ type: "pane.agent_status_changed", pane_id }))];
+    let partial = "";
+    s.on("connect", () => s.write(`${JSON.stringify({ id: "herdr-voice-watch", method: "events.subscribe", params: { subscriptions } })}\n`));
+    s.on("data", (d) => {
+      const lines = (partial + d).split("\n");
+      partial = lines.pop();
+      for (const m of lines.map(parse)) {
+        if (m?.result?.type === "subscription_started") {
+          delay = WATCH_RETRY_MS;
+          subscribed = panes.join(" ");
+          onSnapshot(json, true);
+        } else if (m?.event === "pane.agent_status_changed") onStatus(m.data ?? {});
+        else if (m?.event) { clearTimeout(settle); settle = setTimeout(refresh, WATCH_SETTLE_MS); }
+      }
+    });
+    s.on("error", () => {});
+    s.on("close", () => {
+      if (socket !== s || stopped) return;
+      socket = null;
+      retry = setTimeout(open, delay);
+      delay = Math.min(delay * 2, WATCH_RETRY_MAX_MS);
+    });
+  }
+
+  async function refresh() {
+    const json = await fetch();
+    if (stopped) return;
+    if (paneIds(json).join(" ") === subscribed) return onSnapshot(json, false);
+    // Panes came or went: subscribe again, naming the panes there are now.
+    const s = socket;
+    socket = null;
+    s?.destroy();
+    open();
+  }
+
+  open();
+  return () => { stopped = true; clearTimeout(retry); clearTimeout(settle); socket?.destroy(); };
 }
 
 // Runs `herdr <args>` and returns stdout+stderr. herdr 0.9's CLI cannot focus a pane by ID, so `pane focus <id>` goes to the socket API.
@@ -480,7 +529,11 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
   }
   const shell = env.HERDR_VOICE_SHELL === "1";
   const askFirst = env.HERDR_VOICE_CONFIRM === "1";
-  const busyAgents = new Set();
+  // HERDR_VOICE_REPORT: all (default) reports every agent that finishes or needs input, prompted only the agents the voice sent work or an answer to, off none.
+  const reportMode = ["prompted", "off"].includes(env.HERDR_VOICE_REPORT) ? env.HERDR_VOICE_REPORT : "all";
+  // The phase each pane's agent was last seen in (see AGENT_PHASES), and the panes the voice prompted that have not been reported since.
+  const phases = new Map();
+  const prompted = new Set();
   const watchedPanes = new Set();
   // Counters rather than clocks: the model's call counts as the developer's own when speech started after the last [herdr] report.
   let tick = 0;
@@ -524,11 +577,12 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
     return result(out, `done: ${description}${suffix(out)}`);
   }
 
-  // The last `lines` meaningful lines of an agent's or pane's terminal, condensed and fenced. More is fetched than kept because raw terminal text is mostly padding and spinners.
-  async function readText(kind, id, lines) {
+  // The last `lines` meaningful lines of an agent's or pane's terminal, condensed and fenced, under a header with its name and the line count. More is fetched than kept because raw terminal text is mostly padding and spinners.
+  async function readText(kind, id, lines, name = id) {
     const keep = clamp(lines, 1, READ_LIMIT);
     const out = await herdr([kind, "read", id, "--source", "recent", "--lines", String(keep * 3)]);
-    return untrusted(condense(parse(out)?.result?.read?.text ?? out, keep));
+    const text = condense(parse(out)?.result?.read?.text ?? out, keep);
+    return `${name}: its last ${text ? text.split("\n").length : 0} lines of output, oldest first, newest last.\n${untrusted(text)}`;
   }
   const readAgent = (target, lines) => readText("agent", target, lines);
 
@@ -537,25 +591,32 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
   const resolve = async (query, kind) => resolveTarget(query, await state(), { kinds: [kind] });
   const resolvePane = async (query) => resolveTarget(query, await state(), { pane: true });
 
-  // Sends an instruction and waits only until the agent reacts, so the conversation is not blocked on the whole turn.
+  // Marks the pane of an agent the voice sent work or an answer to, for HERDR_VOICE_REPORT=prompted. Input: the agent's name or pane ID.
+  async function markPrompted(target) {
+    if (reportMode !== "prompted") return;
+    const pane = (await state()).targets.find((t) => t.kind === "pane" && (t.id === target || t.agent === target));
+    if (pane) prompted.add(pane.id);
+  }
+
+  // Sends an instruction and waits only until the agent reacts, so the conversation is not blocked on the whole turn. Its result is reported when herdr says it finished (see agentChanged).
   async function sendPrompt(target, prompt) {
     const out = await herdr(["agent", "prompt", target, prompt, "--wait", "--until", "working", "--until", "blocked", "--timeout", "10000"]);
     const status = agentStatus(out);
-    if (status === "working") { watchAgent(target); return `sent; ${target} is working`; }
+    if (status === "working") { await markPrompted(target); return `sent; ${target} is working`; }
     if (status === "blocked" || errorCode(out) === "agent_blocked") return `${target} needs approval:\n${await readAgent(target, 30)}`;
     return out;
   }
 
-  // Waits in the background until the agent is idle, done or blocked, then tells the model. The wait can last as long as the agent's turn (up to an hour).
-  function watchAgent(target) {
-    if (busyAgents.has(target)) return;
-    busyAgents.add(target);
-    (async () => {
-      // After answer_agent the agent may still show blocked for a moment; let it pick back up first.
-      await herdr(["agent", "wait", target, "--until", "working", "--timeout", "5000"]);
-      const out = await herdr(["agent", "wait", target, "--timeout", "3600000"]);
-      if (!stopped) report(`Agent ${target} is now ${agentStatus(out) ?? "unknown"}. Recent output:\n${await readAgent(target, REPORT_LINES)}`);
-    })().catch(() => {}).finally(() => busyAgents.delete(target));
+  // Input: the data of a pane.agent_status_changed event. Reports once per change into a phase, so an agent going from idle to done, or blocked twice, is not reported again; never for the voice's own pane, and only as HERDR_VOICE_REPORT allows.
+  async function agentChanged({ pane_id: pane, agent_status: status }) {
+    const phase = AGENT_PHASES[status] ?? null;
+    const before = phases.get(pane);
+    phases.set(pane, phase);
+    if (!phase || phase === before || pane === env.HERDR_PANE_ID || reportMode === "off") return;
+    if (reportMode === "prompted" && !prompted.delete(pane)) return;
+    const t = (await state()).targets.find((x) => x.id === pane);
+    if (!t || (only && t.workspace !== only)) return;
+    report(`Agent ${t.label} ${phase}. Say who and the result in one sentence, from this output only.\n${await readText("pane", pane, REPORT_LINES, t.label)}`);
   }
 
   // Waits in the background for the watch's regex in the bottom lines of the pane, then tells the model the outcome.
@@ -587,7 +648,7 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
     if (r.fail) return r.fail;
     const t = r.hit;
     if (t.id === env.HERDR_WORKSPACE_ID || t.id === env.HERDR_TAB_ID) return `error: ${t.label} holds herdr-voice itself; the developer has to close it by hand`;
-    let description = `close ${kind} ${t.label} (${t.id}): ${t.detail}`;
+    let description = `close ${kind} ${t.label}${t.where ? ` in ${t.where}` : ""}: ${t.detail}`;
     let command = [kind, "close", t.id];
     if (tool === "remove_worktree") {
       const tree = rows(await herdr(["worktree", "list", "--workspace", t.id]), "worktrees").find((w) => w.open_workspace_id === t.id);
@@ -670,12 +731,12 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
         if (!Array.isArray(procs)) return `failed: ${out}`;
         // Names only: command lines can carry tokens and passwords, and these go to the voice provider.
         const names = procs.map((x) => x.name ?? x.argv0).filter((n) => typeof n === "string").map((n) => basename(n));
-        return names.length ? `${p.label} (${p.id}) is running: ${names.join(", ")}` : `${p.label} (${p.id}) is at its shell prompt, running nothing`;
+        return names.length ? `${p.label} is running: ${names.join(", ")}` : `${p.label} is at its shell prompt, running nothing`;
       }
       case "close_pane": {
         if (env.HERDR_ENV !== "1") return "error: closing is off because herdr-voice isn't running inside Herdr";
         if (isSelf) return "error: that pane is herdr-voice itself; the developer can close it or run herdr-voice stop";
-        const stop = await allowed(tool, `${tool}:${p.id}`, `close pane ${p.label} (${p.id})`, a, user, true);
+        const stop = await allowed(tool, `${tool}:${p.id}`, `close pane ${p.label}${p.where ? ` in ${p.where}` : ""}`, a, user, true);
         return stop ?? result(await herdr(["pane", "close", p.id]), `closed pane ${p.label}`);
       }
       case "run_in_pane": {
@@ -684,7 +745,7 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
         if (!command) return "error: say the command";
         if (isSelf) return "error: that pane is herdr-voice itself; pick another pane";
         const stop = await allowed(tool, `${tool}:${p.id}:${command}`, `run ${command} in ${p.label}`, a, user, true);
-        return stop ?? result(await herdr(["pane", "run", p.id, command]), `sent the command to ${p.label} (${p.id}); use read_pane or watch_pane to follow it`);
+        return stop ?? result(await herdr(["pane", "run", p.id, command]), `sent the command to ${p.label}; use read_pane or watch_pane to follow it`);
       }
       case "zoom_pane": {
         const mode = text(a, "zoom") ?? "toggle";
@@ -751,7 +812,7 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
         if (stop) return stop;
       }
       const out = await herdr(["agent", "send-keys", target, a.key]);
-      watchAgent(target);
+      await markPrompted(target);
       return out;
     },
 
@@ -859,7 +920,7 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
       const p = await resolvePane(a.target);
       if (p.fail) return p.fail;
       if (p.hit.self) return "error: that pane is herdr-voice itself; say which pane to read";
-      return `pane ${p.hit.label} (${p.hit.id}):\n${await readText("pane", p.hit.id, Number.isInteger(a.lines) ? a.lines : REPORT_LINES)}`;
+      return readText("pane", p.hit.id, Number.isInteger(a.lines) ? a.lines : REPORT_LINES, `pane ${p.hit.label}`);
     },
 
     async watch_pane(a) {
@@ -928,11 +989,13 @@ export function createTools({ emit, env = process.env, runHerdr, gate = new Conf
     // Call when the provider hears the developer start speaking. A tool call made after a [herdr] report with no speech since is treated as the model acting on that report.
     speechStarted() { lastSpeechStart = ++tick; },
 
-    // The model's picture of Herdr now (see describeState).
-    context: async () => describeState(await state()),
-
-    // Calls onChange whenever herdr's workspaces, tabs or panes change. Output: a function that stops watching.
-    watch: (onChange) => watchHerdr(env, onChange),
+    // Follows herdr's events: calls onContext with the model's picture of Herdr (see describeState) when watching starts or restarts and whenever workspaces, tabs or panes change, and reports agents that finish or need input. Output: a function that stops watching.
+    watch: (onContext) => watchHerdr(env, snapshot, (json, started) => {
+      const now = herdrState(json, env.HERDR_PANE_ID);
+      // A new subscription starts from what each agent is doing now, so only later changes are reported.
+      if (started) for (const t of now.targets) if (t.kind === "pane") phases.set(t.id, AGENT_PHASES[t.status] ?? null);
+      onContext(describeState(now));
+    }, (data) => { agentChanged(data).catch(() => {}); }),
 
     // The action waiting for the developer's yes, if any. The voice uses it to let a run_shell question read the command aloud.
     pendingAction: () => gate.pending?.action,

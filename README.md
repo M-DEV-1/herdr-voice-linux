@@ -72,8 +72,16 @@ An action the model takes on its own right after an agent report, with nothing s
 **Names and "this"**
 
 The voice is sent a short list of every workspace, tab and pane, with names, IDs and what is focused, when a session starts and again whenever Herdr reports a change on its event socket.
+The voice says names and never IDs.
+If the Herdr server restarts, herdr-voice reconnects to its event socket (after 0.5 s, doubling up to 30 s between tries) and sends the list again.
 Tools match spoken names without regard to case, punctuation, filler words ("the", "pane", "tab", "workspace", "ticket"), one wrong letter or a cut-short word, and prefer the focused workspace when a name appears in several places.
 "This pane", "this tab" and "this workspace" mean the focused one; the voice's own pane is never read or closed this way.
+
+**Agent reports**
+
+When any agent in Herdr finishes, goes idle or needs input, the voice says one line: which agent, and the result or its question, taken from the agent's latest output.
+It reports each change once, never for its own pane, and waits while you or the voice are talking.
+`HERDR_VOICE_REPORT=prompted` reports only agents the voice sent an instruction or an answer to, and `HERDR_VOICE_REPORT=off` reports none (default `all`).
 
 **Testing with typed turns**
 
