@@ -3,6 +3,83 @@
 I really like ChatGPT's voice agent and decided to create a version that would run natively in Herdr. Enjoy!
                                                                             - Marcus aka BrogrammerMW
 
+## Linux (this fork)
+
+This fork runs on Linux as a single Node script, `linux/herdr-voice.mjs`, with no dependencies and nothing to build.
+It talks to Google's Gemini Live API from a pane in Herdr and has no orb or other window.
+Everything below this section describes the macOS original.
+
+**Requirements**
+
+- Node 22 or newer.
+- PipeWire with `pw-record` and `pw-play`, plus `pactl` to look for the echo-cancelled devices.
+- Herdr 0.9 or newer.
+- A Gemini API key from https://aistudio.google.com/apikey.
+
+**Install and run**
+
+```sh
+herdr plugin install M-DEV-1/herdr-voice-linux
+node linux/herdr-voice.mjs install-command   # from the plugin's directory; links herdr-voice into ~/.local/bin
+herdr-voice setup                            # saves the API key to ~/.config/herdr-voice/gemini.key
+herdr-voice                                  # in a Herdr pane: opens the voice pane below it
+```
+
+Instead of `install-command` you can run the plugin's "Start voice" action, which does the same as typing `herdr-voice`.
+`GEMINI_API_KEY` in the environment is used before the key file.
+`herdr-voice --here` runs in the current pane instead of opening a new one, and `herdr-voice stop` stops the running voice.
+The voice pane opens below the pane you started it from.
+`HERDR_VOICE_START_HIDDEN=1` zooms the pane you started it from over the voice pane instead.
+
+**Pane keys**
+
+The voice pane reads single keys while it has focus (it opens without taking focus from the pane you started it from):
+
+| Key | Action |
+|---|---|
+| `m` | Mute or unmute the microphone. While muted no microphone audio is sent, the voice can still speak, and agent reports are still read out. The pane prints `● muted` or `● listening`. |
+| `Esc` | Stop the voice mid-sentence. |
+| `q` or `Ctrl-C` | Quit, the same as `herdr-voice stop`. |
+
+**Models**
+
+The default model is `gemini-3.1-flash-live-preview`.
+`HERDR_VOICE_GEMINI_MODEL=gemini-2.5-flash-native-audio-preview-12-2025` selects the older native-audio model.
+`HERDR_VOICE_VOICE` sets the voice (default `Kore`).
+These and the other `HERDR_VOICE_*` settings can be exported in the environment or written in `config.env` in the plugin's config directory, which herdr-voice creates as a commented template on its first run in the plugin pane.
+
+**Echo cancellation**
+
+Without echo cancellation the microphone hears the voice, so use headphones or set up a PipeWire echo-cancel pair.
+herdr-voice records from the PipeWire source named `june_ec_source` and plays to the sink named `june_ec_sink` when `pactl list short sources` and `pactl list short sinks` list them, and otherwise uses the default devices.
+To get those names, save this as `~/.config/pipewire/pipewire.conf.d/99-echo-cancel.conf` and restart PipeWire (`systemctl --user restart pipewire pipewire-pulse wireplumber`):
+
+```conf
+context.modules = [
+    {   name = libpipewire-module-echo-cancel
+        args = {
+            aec.method = webrtc
+            aec.args = {
+                webrtc.noise_suppression = true
+                webrtc.extended_filter = true
+            }
+            source.props = {
+                node.name = "june_ec_source"
+                node.description = "Echo-Cancelled Microphone"
+            }
+            sink.props = {
+                node.name = "june_ec_sink"
+                node.description = "Echo-Cancelled Playback"
+            }
+        }
+    }
+]
+```
+
+Audio played to the sink is the reference the module cancels from the source.
+`webrtc.gain_control` is not enabled here; on one setup its automatic gain dropped the source volume to 0.07 and the model heard nothing.
+To use other nodes, set `HERDR_VOICE_MIC` and `HERDR_VOICE_SPEAKER` to PipeWire node names (see `pactl list short sources` and `pactl list short sinks`); they take priority over the detected pair.
+
 **Talk to the coding agents in your [Herdr](https://herdr.dev) panes, and hear them talk back.**
 
 herdr-voice is a macOS plugin for Herdr. Local OpenLive or a realtime cloud model from xAI, OpenAI, or Google

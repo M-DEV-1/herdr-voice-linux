@@ -1,7 +1,7 @@
 // Run with: node --test linux/*.test.mjs
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { GeminiWire, ResponseScheduler, SpeechGate, parseConfig, rms, setupMessage } from './herdr-voice.mjs';
+import { GeminiWire, ResponseScheduler, Session, SpeechGate, hidesOnStart, keyAction, parseConfig, rms, setupMessage } from './herdr-voice.mjs';
 
 const SAMPLES_PER_CHUNK = 320; // 20 ms at 16 kHz
 
@@ -159,4 +159,30 @@ test('config.env keeps HERDR_VOICE_* settings and refuses everything else by nam
   const { settings, rejected } = parseConfig('# note\nexport HERDR_VOICE_VOICE="Puck"\nHERDR_VOICE_STREAM=always\nGEMINI_API_KEY=AIzaSECRET\nAIzaPASTEDKEY\n');
   assert.deepEqual(settings, [['HERDR_VOICE_VOICE', 'Puck'], ['HERDR_VOICE_STREAM', 'always']]);
   assert.deepEqual(rejected, ['GEMINI_API_KEY', 'a line without =']);
+});
+
+test('pane keys: m mutes, a lone Esc stops the voice, q and Ctrl-C quit, arrow keys do nothing', () => {
+  assert.deepEqual(['m', 'M', '\x1b', 'q', '\x03', '\x1b[A', 'x'].map(keyAction), ['mute', 'mute', 'stop', 'quit', 'quit', null, null]);
+});
+
+test('a muted microphone neither wakes the session nor keeps audio, and unmuting restores both', () => {
+  const rand = lcg(5);
+  const session = new Session({ key: 'k', model: 'm', voice: 'v', createTools: () => ({}), speaker: { isSpeaking: false, interrupt() {} } });
+  let connects = 0;
+  session.connect = () => { connects++; };
+  const speak = () => {
+    for (let i = 0; i < 40; i++) session.micChunk(noiseChunk(0.001, rand));
+    for (let i = 0; i < 20; i++) session.micChunk(voicedChunk(0.1, i));
+  };
+  session.toggleMute();
+  speak();
+  assert.deepEqual([connects, session.held.chunks.length], [0, 0]);
+  session.toggleMute();
+  speak();
+  assert.ok(connects > 0 && session.held.chunks.length > 0);
+});
+
+test('the voice pane starts visible unless HERDR_VOICE_START_HIDDEN=1', () => {
+  const env = { HERDR_ENV: '1', HERDR_PANE_ID: 'p', HERDR_PLUGIN_ENTRYPOINT_ID: 'voice' };
+  assert.deepEqual([env, { ...env, HERDR_VOICE_START_HIDDEN: '1' }].map(hidesOnStart), [false, true]);
 });

@@ -99,8 +99,8 @@ const CONFIG_TEMPLATE = `# herdr-voice settings. Uncomment a line to use it; res
 # HERDR_VOICE_GATE_THRESHOLD=0.02
 # Let the voice run shell commands, each after your spoken yes
 # HERDR_VOICE_SHELL=1
-# Show the voice pane when it starts instead of hiding it behind the pane you started it from
-# HERDR_VOICE_START_HIDDEN=0
+# Hide the voice pane behind the pane you started it from (that pane is zoomed over it) instead of showing it below
+# HERDR_VOICE_START_HIDDEN=1
 `;
 
 // Input: the text of config.env. Output: the HERDR_VOICE_* settings as [key, value] pairs, and the names of lines that were refused.
@@ -391,6 +391,13 @@ export class SpeechGate {
     return out;
   }
 
+  // Closes the gate and forgets the audio kept for the next onset, keeping the learned noise floor.
+  reset() {
+    this.isOpen = false;
+    this.loudRun = this.quietRun = this.holdLoudRun = 0;
+    this.preRoll = [];
+  }
+
   remember(level) {
     if (this.recent.length < SpeechGate.FLOOR_WINDOW) { this.recent.push(level); return; }
     this.recent[this.recentIndex] = level;
@@ -621,6 +628,7 @@ export class Session {
     this.leaked = null;
     this.correctedLeak = false;
     this.dropping = false;
+    this.muted = false;
     this.held = new HeldMic();
     this.midTurn = false;
     this.lastSpeech = Date.now();
@@ -649,6 +657,7 @@ export class Session {
   // ----- microphone, every 20 ms -----
 
   micChunk(chunk) {
+    if (this.muted) return;
     const level = rms(chunk);
     const wasOpen = this.gate.isOpen;
     if (this.gated && level > this.gate.openThreshold) this.lastLoud = Date.now();
@@ -685,6 +694,17 @@ export class Session {
     if (this.status !== 'disconnected' || this.retryPending) return;
     if (this.dormant) { this.dormant = false; this.attempts = 0; log('heard you; reopening the session'); }
     this.connect();
+  }
+
+  // Mutes or unmutes the microphone. While muted no mic audio is sent or kept, but the voice still speaks and agent reports still arrive. Muting also ends the turn Gemini was hearing.
+  toggleMute() {
+    this.muted = !this.muted;
+    if (this.muted) {
+      this.gate.reset();
+      this.held.drain();
+      if (this.mayStream) this.sendRaw(AUDIO_END);
+    }
+    log(this.muted ? '● muted' : '● listening');
   }
 
   // Every 5 s: close a session nobody has talked to for three minutes, if nothing is speaking or running.
@@ -886,13 +906,13 @@ export class Session {
     }
   }
 
-  // Stops the voice mid-sentence (a spoken "stop"): drops queued audio and the rest of the reply.
-  stopSpeech() {
+  // Stops the voice mid-sentence (a spoken "stop" or the Esc key): drops queued audio and the rest of the reply. `reason` goes in the log line.
+  stopSpeech(reason = 'you said stop') {
     if (!this.replies.responseActive && !this.speaker.isSpeaking) return;
     this.replies.reset();
     this.dropping = true;
     this.speaker.interrupt();
-    log('■ stopped (you said stop)');
+    log(`■ stopped (${reason})`);
   }
 
   // After a reply that read code-like text aloud: tells the model once per turn of yours, without asking for another reply.
@@ -974,9 +994,9 @@ export function runsHere(args, env) {
   return args.includes('--here') || env.HERDR_PLUGIN_ENTRYPOINT_ID !== undefined || env.HERDR_ENV !== '1';
 }
 
-// Whether the voice pane hides itself behind the pane it opened next to (on unless HERDR_VOICE_START_HIDDEN=0). Only the plugin's own pane does, since zooming a neighbour over a pane you run --here in would hide your work.
+// Whether the voice pane hides itself behind the pane it opened next to (off unless HERDR_VOICE_START_HIDDEN=1). Only the plugin's own pane does, since zooming a neighbour over a pane you run --here in would hide your work.
 export function hidesOnStart(env) {
-  return env.HERDR_VOICE_START_HIDDEN !== '0' && env.HERDR_ENV === '1' && env.HERDR_PANE_ID !== undefined && env.HERDR_PLUGIN_ENTRYPOINT_ID !== undefined;
+  return env.HERDR_VOICE_START_HIDDEN === '1' && env.HERDR_ENV === '1' && env.HERDR_PANE_ID !== undefined && env.HERDR_PLUGIN_ENTRYPOINT_ID !== undefined;
 }
 
 // Opens the plugin's voice pane below the pane this was typed in. False when that is not possible (plugin not installed), so the caller runs here instead.
@@ -984,8 +1004,8 @@ function openVoicePane() {
   const target = process.env.HERDR_PANE_ID ? ['--target-pane', process.env.HERDR_PANE_ID] : [];
   const r = herdr(['plugin', 'pane', 'open', '--plugin', PLUGIN_ID, '--entrypoint', 'voice', '--placement', 'split', '--direction', 'down', '--no-focus', ...target]);
   if (r.status !== 0 || r.stdout.includes('"error"')) return false;
-  log(process.env.HERDR_VOICE_START_HIDDEN !== '0'
-    ? 'herdr-voice is starting, hidden behind this pane. Unzoom this pane to see it (HERDR_VOICE_START_HIDDEN=0 shows it); stop it with herdr-voice stop.'
+  log(process.env.HERDR_VOICE_START_HIDDEN === '1'
+    ? 'herdr-voice is starting, hidden behind this pane. Unzoom this pane to see it; stop it with herdr-voice stop.'
     : 'herdr-voice is starting in the pane below. Close that pane, or run herdr-voice stop, to end it.');
   return true;
 }
@@ -1000,6 +1020,16 @@ function hideVoicePane(voicePane) {
     if (neighbor && neighbor !== voicePane) { cover = neighbor; break; }
   }
   if (cover) herdr(['pane', 'zoom', cover, '--on']);
+}
+
+// Maps the text of one keyboard read in the voice pane to what the voice does. Output: 'mute', 'stop', 'quit', or null for any other key. Arrow keys begin with the Esc byte, so only a read that is exactly Esc stops the voice.
+export function keyAction(text) {
+  switch (text) {
+    case 'm': case 'M': return 'mute';
+    case '\x1b': return 'stop';
+    case 'q': case 'Q': case '\x03': return 'quit';
+    default: return null;
+  }
 }
 
 // One herdr-voice at a time: a second would share the mic, hear the first one's voice and double the bill. The lock is a pid file, valid while that pid is a running herdr-voice.
@@ -1096,6 +1126,21 @@ async function main() {
   };
   session.onFatal = () => quit(1);
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => quit(0));
+
+  // In a terminal the pane takes single keys, since there is no orb to click. Raw mode is switched off again on exit.
+  if (process.stdin.isTTY && !selftest) {
+    log('keys: m mute, Esc stop the voice talking, q quit');
+    process.stdin.setRawMode(true);
+    process.on('exit', () => process.stdin.setRawMode(false));
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (text) => {
+      const action = keyAction(text);
+      if (action === 'mute') session.toggleMute();
+      else if (action === 'stop') session.stopSpeech('Esc');
+      else if (action === 'quit') quit(0);
+    });
+    process.stdin.resume();
+  }
 
   if (selftest) {
     // Sends text instead of microphone audio and passes once Gemini has called a tool and sent audio back.

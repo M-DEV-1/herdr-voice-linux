@@ -25,8 +25,8 @@ width = "70%"
 height = 16
 command = ["node", "linux/herdr-voice.mjs", "setup"]
 
-# Same as typing herdr-voice: opens the voice pane below the focused pane, hidden behind it unless
-# HERDR_VOICE_START_HIDDEN=0. Bind it to a key (see the README).
+# Same as typing herdr-voice: opens the voice pane below the focused pane. HERDR_VOICE_START_HIDDEN=1
+# hides it behind the focused pane instead. Bind it to a key (see the README).
 [[actions]]
 id = "start"
 title = "Start voice"
