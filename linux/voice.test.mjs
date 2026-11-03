@@ -1,7 +1,10 @@
 // Run with: node --test linux/*.test.mjs
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { GeminiWire, ResponseScheduler, Session, SpeechGate, SpeechPolicy, echoCancelNodes, hidesOnStart, keyAction, parseConfig, rms, setupMessage } from './herdr-voice.mjs';
+import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { EchoGuard, GeminiWire, Mic, PlaybackLevels, ResponseScheduler, Session, SpeechGate, SpeechPolicy, echoCancelNodes, hidesOnStart, keyAction, parseConfig, rms, setupMessage } from './herdr-voice.mjs';
 import { ConfirmGate, createTools } from './tools.mjs';
 
 const SAMPLES_PER_CHUNK = 320; // 20 ms at 16 kHz
@@ -141,6 +144,7 @@ test('setup carries the model, voice, tools and session features', () => {
   assert.deepEqual(s.tools, [{ functionDeclarations: [{ name: 'list_agents', description: 'List agents', parametersJsonSchema: declarations[0].parameters }] }]);
   assert.equal(s.sessionResumption.handle, 'h-42');
   assert.deepEqual(s.contextWindowCompression, { slidingWindow: {} });
+  assert.deepEqual(s.realtimeInputConfig.automaticActivityDetection, { startOfSpeechSensitivity: 'START_SENSITIVITY_LOW', prefixPaddingMs: 300, silenceDurationMs: 800 });
   // Only the 2.x models take Google Search beside function tools.
   assert.equal(setupMessage({ ...base, model: 'gemini-2.5-flash-native-audio-preview-12-2025' }).setup.tools.length, 2);
 });
@@ -168,7 +172,7 @@ test('pane keys: m mutes, a lone Esc stops the voice, q and Ctrl-C quit, arrow k
 
 test('a muted microphone neither wakes the session nor keeps audio, and unmuting restores both', () => {
   const rand = lcg(5);
-  const session = new Session({ key: 'k', model: 'm', voice: 'v', createTools: () => ({}), speaker: { isSpeaking: false, interrupt() {} } });
+  const session = new Session({ key: 'k', model: 'm', voice: 'v', createTools: () => ({}), speaker: { isSpeaking: false, interrupt() {}, level: () => 0 } });
   let connects = 0;
   session.connect = () => { connects++; };
   const speak = () => {
@@ -189,7 +193,7 @@ test('the voice pane starts visible unless HERDR_VOICE_START_HIDDEN=1', () => {
 });
 
 // A session already connected to a recording socket, with the given tools and speaker. Server messages are fed in with feed().
-function liveSession({ tools = {}, speaker = { isSpeaking: false, until: 0, interrupt() {} }, createTools: make } = {}) {
+function liveSession({ tools = {}, speaker = { isSpeaking: false, until: 0, interrupt() {}, level: () => 0 }, createTools: make } = {}) {
   const session = new Session({ key: 'k', model: 'm', voice: 'v', greet: false, speaker, createTools: make ?? (() => ({ declarations: [], run: async () => ({ output: 'x' }), ...tools })) });
   const sent = [];
   session.socket = { readyState: 1, send: (text) => sent.push(JSON.parse(text)), addEventListener(_, done) { this.done = done; }, close() { this.done?.(); } };
@@ -291,4 +295,64 @@ test('echo-cancel nodes are found by their node.group, not by name, and monitors
   const listing = [entry('Source', 1, 'alsa_input.pci', ''), entry('Source', 2, 'echo-cancel-source', 'echo-cancel-77-12'), entry('Source', 3, 'echo-cancel-sink.monitor', 'echo-cancel-77-12')].join('\n');
   assert.deepEqual(echoCancelNodes(listing), ['echo-cancel-source']);
   assert.deepEqual(echoCancelNodes(entry('Sink', 4, 'alsa_output.pci', '')), []);
+});
+
+// Feeds a session with a fake speaker: 2 s of room noise at 0.001, then 3 s of playback at `play` while the mic hears `echo` and, every fourth chunk, the quieter audio the canceller leaves. Returns the session.
+function echoRun(play, echo) {
+  const rand = lcg(11);
+  let playing = 0;
+  const session = new Session({ key: 'k', model: 'm', voice: 'v', createTools: () => ({}), speaker: { isSpeaking: false, interrupt() {}, level: () => playing } });
+  session.connect = () => {};
+  for (let i = 0; i < 100; i++) session.micChunk(noiseChunk(0.001, rand));
+  playing = play;
+  for (let i = 0; i < 150; i++) session.micChunk(i % 4 ? noiseChunk(echo, rand) : noiseChunk(0.0001, rand));
+  return session;
+}
+
+for (const ratio of [0.05, 0.1, 0.2]) {
+  test(`echo at ${ratio} of the playback level neither opens the gate nor lowers the noise floor`, () => {
+    const session = echoRun(0.1, 0.1 * ratio);
+    assert.equal(session.held.chunks.length, 0, 'echo was kept as speech');
+    assert.ok(session.gate.noiseFloor > 0.0005, `floor fell to ${session.gate.noiseFloor}`);
+  });
+}
+
+test('speech louder than the guard ratio still opens the gate while the voice plays', () => {
+  const session = echoRun(0.1, 0.1 * EchoGuard.RATIO * 1.5);
+  assert.ok(session.held.chunks.length > 0);
+});
+
+test('the echo reference fades after playback stops instead of dropping at once', () => {
+  const guard = new EchoGuard();
+  guard.isEcho(0, 0.1);
+  assert.equal(guard.isEcho(0.02, 0), true); // 20 ms later: reverb at a fifth of the playback is still echo
+  for (let i = 0; i < 40; i++) guard.isEcho(0, 0);
+  assert.equal(guard.isEcho(0.0001, 0), false);
+});
+
+test('playback levels follow when audio plays, not when it was written', () => {
+  const levels = new PlaybackLevels();
+  // One second written at once: the first half loud, the second half silent, playing from t = 1000 ms.
+  const pcm = Buffer.alloc(48000);
+  for (let i = 0; i < 12000; i++) pcm.writeInt16LE(i % 2 ? 3277 : -3277, i * 2);
+  levels.add(pcm, 1000);
+  assert.equal(levels.at(990), 0);
+  assert.ok(Math.abs(levels.at(1200) - 0.1) < 0.001);
+  assert.ok(levels.at(1700) > 0.09); // the loud half ended 200 ms ago, inside the window
+  assert.equal(levels.at(1900), 0);
+});
+
+test('the microphone drops the first second after pw-record starts', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'herdr-voice-mic-'));
+  // A pw-record stand-in: 1 s of bytes 1, then 0.5 s of bytes 2, then it exits.
+  writeFileSync(join(dir, 'pw-record'), "#!/bin/sh\nhead -c 32000 /dev/zero | tr '\\0' '\\1'\nhead -c 16000 /dev/zero | tr '\\0' '\\2'\n");
+  chmodSync(join(dir, 'pw-record'), 0o755);
+  const path = process.env.PATH;
+  process.env.PATH = `${dir}:${path}`;
+  const chunks = [];
+  try {
+    await new Promise((done) => new Mic(null).start((c) => chunks.push(c), done));
+  } finally { process.env.PATH = path; }
+  assert.equal(chunks.length, 25);
+  assert.ok(chunks.every((c) => c.every((b) => b === 2)));
 });

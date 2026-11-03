@@ -15,6 +15,11 @@ const DEFAULT_VOICE = 'Kore';
 const IN_RATE = 16000;
 const OUT_BYTES_PER_SECOND = 48000;
 const CHUNK_BYTES = IN_RATE * 2 / 50;
+const OUT_CHUNK_BYTES = OUT_BYTES_PER_SECOND / 50;
+// june_ec_source passes noise up to -37 dBFS in the first 0.5 s after pw-record starts (measured), so the first second of mic audio is dropped.
+const MIC_SETTLE_BYTES = IN_RATE * 2;
+// A mic chunk is compared with the loudest 20 ms of the voice scheduled to play in the last 250 ms, because its echo reaches june_ec_source about 200 ms after it is scheduled (measured: 150 to 170 ms to the raw mic, plus 40 ms through the canceller).
+const ECHO_WINDOW_MS = 250;
 const QUIET_CLOSE_MS = 180_000;
 const BARGE_IN_MS = 1500;
 const ECHO_TAIL_MS = 500;
@@ -223,6 +228,8 @@ export function setupMessage({ model, voice, instructions, declarations, resumeH
         responseModalities: ['AUDIO'],
         speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
       },
+      // Gemini's own voice detection at its default high sensitivity starts turns on the echo the canceller leaves, so it starts on speech only at low sensitivity.
+      realtimeInputConfig: { automaticActivityDetection: { startOfSpeechSensitivity: 'START_SENSITIVITY_LOW', prefixPaddingMs: 300, silenceDurationMs: 800 } },
       systemInstruction: { parts: [{ text: instructions }] },
       tools,
       inputAudioTranscription: {},
@@ -412,6 +419,44 @@ export class SpeechGate {
   }
 }
 
+// Tells the voice's own echo apart from your speech. Echo cancellation leaves the voice's echo 22 to 26 dB below its playback level (p99, measured on june_ec_source), so a mic chunk at or below RATIO of the playback level is echo.
+export class EchoGuard {
+  // 0.25 is 12 dB below playback, 10 dB above the loudest measured echo. Speech over the voice has to be louder than this to count.
+  static RATIO = 0.25;
+  // Echo and room reverb outlast a drop in playback, so the reference fades by 0.85 per 20 ms chunk (about 60 dB over 0.8 s) instead of following playback down.
+  static DECAY = 0.85;
+  reference = 0;
+
+  // Input: a 20 ms mic chunk's rms level and the playback level for it (see PlaybackLevels). Output: true when the chunk is echo.
+  isEcho(level, playback) {
+    this.reference = Math.max(playback, this.reference * EchoGuard.DECAY);
+    return level <= this.reference * EchoGuard.RATIO;
+  }
+}
+
+// The voice's level over time. Gemini sends audio faster than it plays, so each 20 ms of PCM written to pw-play is filed under the time it will play.
+export class PlaybackLevels {
+  entries = []; // [time it plays in ms, rms level], oldest first
+
+  // Input: 24 kHz mono s16le PCM and the time its first sample plays.
+  add(pcm, startsAt) {
+    for (let offset = 0, at = startsAt; offset < pcm.length; offset += OUT_CHUNK_BYTES, at += 20) this.entries.push([at, rms(pcm.subarray(offset, offset + OUT_CHUNK_BYTES))]);
+  }
+
+  // Output: the loudest 20 ms that played in the ECHO_WINDOW_MS up to `now`, or 0 when nothing did.
+  at(now) {
+    while (this.entries.length && this.entries[0][0] < now - ECHO_WINDOW_MS) this.entries.shift();
+    let loudest = 0;
+    for (const [at, level] of this.entries) {
+      if (at > now) break;
+      loudest = Math.max(loudest, level);
+    }
+    return loudest;
+  }
+
+  clear() { this.entries = []; }
+}
+
 // Enforces the speaking style in code. A reply whose audio passes 20 s is cut, and code-like text in the transcript (code, paths, URLs, file names, diffs) is flagged once so the model can be corrected afterwards. With allowCode the text is not checked, for a run_shell question that reads the command aloud on purpose.
 export class SpeechPolicy {
   static MAX_AUDIO_SECONDS = 20;
@@ -560,16 +605,18 @@ function pickTarget(kind) {
   return listing.includes(`Name: ${june}\n`) ? june : echoCancelNodes(listing)[0] ?? null;
 }
 
-// Records 16 kHz mono s16le from pw-record and hands out 20 ms chunks.
-class Mic {
+// Records 16 kHz mono s16le from pw-record and hands out 20 ms chunks, after dropping the first MIC_SETTLE_BYTES.
+export class Mic {
   constructor(target) { this.target = target; }
 
   start(onChunk, onDied) {
     const args = ['--rate', String(IN_RATE), '--channels', '1', '--format', 's16', '--latency', '20ms', ...(this.target ? ['--target', this.target] : []), '-'];
     const proc = this.proc = spawn('pw-record', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let pending = Buffer.alloc(0), errors = '';
+    let pending = Buffer.alloc(0), errors = '', settle = MIC_SETTLE_BYTES;
     proc.stdout.on('data', (data) => {
-      pending = Buffer.concat([pending, data]);
+      const skip = Math.min(settle, data.length);
+      settle -= skip;
+      pending = Buffer.concat([pending, data.subarray(skip)]);
       while (pending.length >= CHUNK_BYTES) {
         onChunk(Buffer.from(pending.subarray(0, CHUNK_BYTES)));
         pending = pending.subarray(CHUNK_BYTES);
@@ -587,9 +634,13 @@ class Mic {
 class Speaker {
   proc = null;
   until = 0;
+  levels = new PlaybackLevels();
   constructor(target) { this.target = target; }
 
   get isSpeaking() { return Date.now() < this.until; }
+
+  // The playback level the mic's echo at time `now` comes from.
+  level(now) { return this.levels.at(now); }
 
   play(pcm) {
     if (!this.proc) {
@@ -600,7 +651,9 @@ class Speaker {
       proc.on('exit', () => { if (this.proc === proc) this.proc = null; });
     }
     this.proc.stdin.write(pcm);
-    this.until = Math.max(this.until, Date.now()) + pcm.length * 1000 / OUT_BYTES_PER_SECOND;
+    const startsAt = Math.max(this.until, Date.now());
+    this.levels.add(pcm, startsAt);
+    this.until = startsAt + pcm.length * 1000 / OUT_BYTES_PER_SECOND;
   }
 
   // Stops the voice at once. Returns whether it was audible.
@@ -609,6 +662,7 @@ class Speaker {
     const p = this.proc;
     this.proc = null;
     this.until = 0;
+    this.levels.clear();
     p?.kill('SIGKILL');
     return was;
   }
@@ -621,6 +675,7 @@ export class Session {
   constructor({ key, model, voice, createTools, mic, speaker, gated = true, threshold = null, greet = true }) {
     Object.assign(this, { key, model, voice, mic, speaker, gated });
     this.gate = new SpeechGate(threshold);
+    this.echo = new EchoGuard();
     this.wire = new GeminiWire();
     this.socket = null;
     this.status = 'disconnected';
@@ -680,7 +735,9 @@ export class Session {
 
   micChunk(chunk) {
     if (this.muted) return;
-    const level = rms(chunk);
+    let level = rms(chunk);
+    // The voice's own echo counts as the noise floor, so it neither opens the gate nor teaches the floor the quieter audio the canceller leaves during playback.
+    if (this.echo.isEcho(level, this.speaker.level(Date.now()))) level = this.gate.noiseFloor;
     const wasOpen = this.gate.isOpen;
     if (this.gated && level > this.gate.openThreshold) this.lastLoud = Date.now();
     const chunks = this.gated ? this.gate.process(chunk, level, this.midTurn) : [chunk];
