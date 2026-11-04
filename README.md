@@ -19,13 +19,13 @@ Everything below this section describes the macOS original.
 **Install and run**
 
 ```sh
-herdr plugin install M-DEV-1/herdr-voice-linux
-herdr plugin action invoke install-command --plugin brogrammermw.herdr-voice   # links herdr-voice into ~/.local/bin
-herdr-voice setup                                                              # saves the API key to ~/.config/herdr-voice/gemini.key
-herdr-voice                                                                    # in a Herdr pane: opens the voice pane below it
+herdr plugin install M-DEV-1/herdr-voice-linux   # also links herdr-voice into ~/.local/bin
+herdr-voice setup                                # saves the API key to ~/.config/herdr-voice/gemini.key
+herdr-voice                                      # in a Herdr pane: opens the voice pane below it
 ```
 
-Herdr keeps the installed copy under `~/.config/herdr/plugins/github-installations/`, in a folder that changes with each update, so run the `install-command` action again after `herdr plugin update`.
+Herdr keeps the installed copy under `~/.config/herdr/plugins/github-installations/`, in a folder that changes with each update, so every install and update re-links `~/.local/bin/herdr-voice` to the new copy.
+`herdr plugin link` skips that step; run `node linux/herdr-voice.mjs install-command` from the clone instead.
 Instead of typing `herdr-voice` you can run the plugin's "Start voice" action (`herdr plugin action invoke start --plugin brogrammermw.herdr-voice`), which opens the voice pane below the focused pane.
 `GEMINI_API_KEY` in the environment is used before the key file.
 `herdr-voice --here` runs in the current pane instead of opening a new one, and `herdr-voice stop` stops the running voice.
