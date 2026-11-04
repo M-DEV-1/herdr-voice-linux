@@ -99,6 +99,9 @@ These and the other `HERDR_VOICE_*` settings can be exported in the environment 
 
 `HERDR_VOICE_ECHO_RATIO` (default 0.25) sets how loud the microphone must be, as a share of the voice's own playback level, to count as you rather than the voice's echo while it speaks; `0` turns this check off.
 
+Earphones (wired or Bluetooth) are recommended. Nothing leaks from them into the microphone, so this check is turned off and you can talk over the voice at a normal level.
+`HERDR_VOICE_OUTPUT` (default `auto`) says what the voice plays through. With `auto`, herdr-voice follows the echo-cancel sink to the device it plays on, every 3 s, and counts a headphones or headset port, a headset or headphone form factor, or a Bluetooth sink as earphones; a speaker port or anything else counts as speakers and keeps the check on. The pane prints a line such as `● earphones: echo guard off` when this changes. `speakers` or `earphones` fixes the answer.
+
 Without echo cancellation the microphone hears the voice, so use headphones or set up a PipeWire echo-cancel pair.
 herdr-voice records from the PipeWire source named `june_ec_source` and plays to the sink named `june_ec_sink` when `pactl list sources` and `pactl list sinks` list them. If they are not there it uses the first source and sink made by PipeWire's echo-cancel module (their `node.group` property starts with `echo-cancel-`), and otherwise the default devices.
 To get those names, save this as `~/.config/pipewire/pipewire.conf.d/99-echo-cancel.conf` and restart PipeWire (`systemctl --user restart pipewire pipewire-pulse wireplumber`):

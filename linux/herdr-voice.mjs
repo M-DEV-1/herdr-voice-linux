@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // herdr-voice for Linux: talk to the coding agents in your Herdr panes through Gemini Live, from a Herdr pane.
 // This is the voice and session side of the macOS plugin. The tools the model can call live in tools.mjs.
-import { spawn, spawnSync } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -27,6 +27,8 @@ const ECHO_WINDOW_MS = 250;
 const QUIET_CLOSE_MS = 180_000;
 const BARGE_IN_MS = 1500;
 const ECHO_TAIL_MS = 500;
+// How often the output device is checked for earphones being plugged in or out.
+const OUTPUT_CHECK_MS = 3000;
 // After you stop talking Gemini starts its reply within about a second; until it does, or for at most REPLY_WAIT_MS, nothing else is sent. Held messages are checked again every IDLE_CHECK_MS.
 const REPLY_WAIT_MS = 4000;
 const IDLE_CHECK_MS = 250;
@@ -105,6 +107,8 @@ const CONFIG_TEMPLATE = `# herdr-voice settings. Uncomment a line to use it; res
 # HERDR_VOICE_GATE_THRESHOLD=0.02
 # While the voice plays, mic audio quieter than this share of its playback level counts as its echo. Raise it if the voice interrupts itself, lower it if talking over the voice does not stop it; 0 turns this off
 # HERDR_VOICE_ECHO_RATIO=0.25
+# What the voice plays through: auto (read it from PipeWire), speakers or earphones. With earphones the voice cannot leak into the mic, so the echo guard above is off and you can talk over the voice at any level
+# HERDR_VOICE_OUTPUT=auto
 # Let the voice run shell commands, each after your spoken yes
 # HERDR_VOICE_SHELL=1
 # For testing: refuse every action on workspaces, tabs, panes and agents outside this workspace ID, and creating workspaces
@@ -440,6 +444,8 @@ export class EchoGuard {
   // Echo and room reverb outlast a drop in playback, so the reference fades by 0.85 per 20 ms chunk (about 60 dB over 0.8 s) instead of following playback down.
   static DECAY = 0.85;
   reference = 0;
+  // True while the voice plays through earphones, which leak nothing into the mic: then no chunk is echo.
+  off = false;
 
   // ratio comes from HERDR_VOICE_ECHO_RATIO when set; 0 turns the guard off.
   constructor(ratio = EchoGuard.RATIO) { this.ratio = ratio; }
@@ -447,7 +453,7 @@ export class EchoGuard {
   // Input: a 20 ms mic chunk's rms level and the playback level for it (see PlaybackLevels). Output: true when the chunk is echo.
   isEcho(level, playback) {
     this.reference = Math.max(playback, this.reference * EchoGuard.DECAY);
-    return level <= this.reference * this.ratio && this.ratio > 0;
+    return level <= this.reference * this.ratio && this.ratio > 0 && !this.off;
   }
 }
 
@@ -614,11 +620,17 @@ export function rms(pcm) {
   return n ? Math.sqrt(sum / n) : 0;
 }
 
+// Input: the output of any `pactl list` command. Output: one string per entry ("Sink #39 ...", "Sink Input #40 ..."), since only entry headers start at the beginning of a line.
+const pactlEntries = (listing) => listing.split(/\n(?=\S)/).filter((entry) => /^\S.* #\d+/.test(entry));
+const pactlName = (entry) => entry.match(/^\s*Name: (\S+)/m)?.[1];
+// Input: one pactl entry and a property name such as node.group. Output: its value, or undefined.
+const pactlProp = (entry, key) => entry.split('\n').map((line) => line.trim()).find((line) => line.startsWith(`${key} = "`))?.slice(key.length + 4, -1);
+
 // Input: the output of `pactl list sources` or `pactl list sinks`. Output: the names of the nodes made by PipeWire's echo-cancel module, which tags them with a node.group starting "echo-cancel-". Monitor sources are left out.
 export function echoCancelNodes(listing) {
-  return listing.split(/\n(?=(?:Source|Sink) #\d+)/)
-    .filter((entry) => /node\.group = "echo-cancel-/.test(entry))
-    .map((entry) => entry.match(/^\s*Name: (\S+)/m)?.[1])
+  return pactlEntries(listing)
+    .filter((entry) => pactlProp(entry, 'node.group')?.startsWith('echo-cancel-'))
+    .map(pactlName)
     .filter((name) => name && !name.endsWith('.monitor'));
 }
 
@@ -629,6 +641,53 @@ function pickTarget(kind) {
   const june = kind === 'source' ? 'june_ec_source' : 'june_ec_sink';
   const listing = spawnSync('pactl', ['list', `${kind}s`], { encoding: 'utf8' }).stdout ?? '';
   return listing.includes(`Name: ${june}\n`) ? june : echoCancelNodes(listing)[0] ?? null;
+}
+
+// Port types and form factors that mean the sound goes into your ears, not into the room.
+const EARPHONES = /head(phone|set)|earbud|earpiece|hands-?free/i;
+
+// Input: `pactl list sinks` and `pactl list sink-inputs` listings and the name of the sink herdr-voice plays to. Output: the sink entry the sound finally leaves through, or undefined when that is not known.
+// An echo-cancel sink (or another filter sink) passes its sound on through a playback stream in the same node.group, so that stream's sink is followed, a few hops at most.
+export function outputSink(sinks, inputs, name) {
+  const all = pactlEntries(sinks), streams = pactlEntries(inputs);
+  let sink = all.find((entry) => pactlName(entry) === name);
+  for (let hop = 0; sink && hop < 4; hop++) {
+    const group = pactlProp(sink, 'node.group');
+    const stream = group && streams.find((entry) => pactlProp(entry, 'node.group') === group);
+    if (!stream) return sink;
+    const index = stream.match(/^\s*Sink: (\d+)/m)?.[1];
+    sink = all.find((entry) => entry.startsWith(`Sink #${index}\n`));
+  }
+  return sink;
+}
+
+// Input: one `pactl list sinks` entry, or undefined. Output: 'earphones' when its active port type or its form factor is headphones, a headset or earbuds, or when it is a Bluetooth sink that is not a speaker; else 'speakers', which keeps the echo guard on.
+export function outputKind(sink) {
+  if (!sink) return 'speakers';
+  const lines = sink.split('\n').map((line) => line.trim());
+  const port = lines.find((line) => line.startsWith('Active Port: '))?.slice('Active Port: '.length);
+  const portType = (port && lines.find((line) => line.startsWith(`${port}: `))?.match(/\(type: ([^,)]+)/)?.[1]) ?? port;
+  for (const label of [portType ?? '', pactlProp(sink, 'device.form_factor') ?? '']) {
+    if (EARPHONES.test(label)) return 'earphones';
+    if (/speaker/i.test(label)) return 'speakers';
+  }
+  return pactlProp(sink, 'device.bus') === 'bluetooth' || pactlName(sink)?.startsWith('bluez_output.') ? 'earphones' : 'speakers';
+}
+
+// Calls onChange('earphones' or 'speakers') once the device behind `target` (null for the default sink) is known, and again whenever it changes kind, checking every OUTPUT_CHECK_MS. HERDR_VOICE_OUTPUT=speakers or earphones fixes the answer instead.
+function watchOutput(target, onChange) {
+  const setting = process.env.HERDR_VOICE_OUTPUT || 'auto';
+  if (setting === 'speakers' || setting === 'earphones') return onChange(setting);
+  if (setting !== 'auto') log(`! HERDR_VOICE_OUTPUT=${setting} is not auto, speakers or earphones; using auto`);
+  const pactl = (...args) => new Promise((done) => execFile('pactl', args, (err, out) => done(err ? '' : out)));
+  let last = null;
+  const check = async () => {
+    const [sinks, inputs, name] = await Promise.all([pactl('list', 'sinks'), pactl('list', 'sink-inputs'), target ?? pactl('get-default-sink')]);
+    const kind = outputKind(outputSink(sinks, inputs, name.trim()));
+    if (kind !== last) onChange(last = kind);
+  };
+  check();
+  setInterval(check, OUTPUT_CHECK_MS).unref();
 }
 
 // Records 16 kHz mono s16le from pw-record and hands out 20 ms chunks, dropping the first MIC_SETTLE_BYTES of each run. If pw-record exits (PipeWire restarted), it is started again after MIC_RESTART_MS; only a failure to start it at all is fatal.
@@ -1391,6 +1450,7 @@ async function main() {
     process.exit(code);
   };
   session.onFatal = () => quit(1);
+  if (!selftest) watchOutput(speakerTarget, (kind) => { session.echo.off = kind === 'earphones'; log(`● ${kind}: echo guard ${session.echo.off ? 'off' : 'on'}`); });
   const voicePane = process.env.HERDR_ENV === '1' ? process.env.HERDR_PANE_ID : undefined;
   const orb = startOrb({
     session, log,
