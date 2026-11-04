@@ -4,7 +4,7 @@ import test from 'node:test';
 import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { EchoGuard, GeminiWire, Mic, PlaybackLevels, ResponseScheduler, Session, SpeechGate, SpeechPolicy, echoCancelNodes, hidesOnStart, systemPrompt, keyAction, parseConfig, rms, setupMessage } from './herdr-voice.mjs';
+import { EchoGuard, GeminiWire, Mic, PlaybackLevels, ResponseScheduler, Session, SpeechGate, SpeechPolicy, echoCancelNodes, hidesOnStart, outputKind, outputSink, systemPrompt, keyAction, parseConfig, rms, setupMessage } from './herdr-voice.mjs';
 import { ConfirmGate, createTools } from './tools.mjs';
 
 const SAMPLES_PER_CHUNK = 320; // 20 ms at 16 kHz
@@ -308,12 +308,52 @@ test('echo-cancel nodes are found by their node.group, not by name, and monitors
   assert.deepEqual(echoCancelNodes(entry('Sink', 4, 'alsa_output.pci', '')), []);
 });
 
+// A `pactl list sinks` entry shaped like PipeWire's: a sink with its properties, its ports as "name: description (type: T, ...)", and the active one.
+function pactlSink(id, name, props, ports = [], active = ports[0]?.[0]) {
+  const lines = [`Sink #${id}`, '\tState: SUSPENDED', `\tName: ${name}`, `\tDescription: ${name}`, '\tProperties:', `\t\tnode.name = "${name}"`, ...Object.entries(props).map(([k, v]) => `\t\t${k} = "${v}"`)];
+  if (ports.length) lines.push('\tPorts:', ...ports.map(([port, type]) => `\t\t${port}: ${type} (type: ${type}, priority: 100, availability unknown)`), `\tActive Port: ${active}`);
+  return `${lines.join('\n')}\n\tFormats:\n\t\tpcm\n`;
+}
+const SOF = { 'alsa.card_name': 'sof-hda-dsp', 'device.bus': 'pci', 'node.nick': 'Speaker + Headphones', 'media.class': 'Audio/Sink' };
+const SOF_PORTS = [['[Out] Speaker', 'Speaker'], ['[Out] Headphones', 'Headphones']];
+
+test('the output counts as earphones for a headphone or headset port or a Bluetooth headset, and as speakers otherwise', () => {
+  const cases = [
+    ['wired headphones', pactlSink(63, 'alsa_output.pci.HiFi__hw_sofhdadsp__sink', SOF, SOF_PORTS, '[Out] Headphones'), 'earphones'],
+    ['the built-in speaker', pactlSink(63, 'alsa_output.pci.HiFi__hw_sofhdadsp__sink', SOF, SOF_PORTS, '[Out] Speaker'), 'speakers'],
+    ['a USB headset', pactlSink(70, 'alsa_output.usb-headset.analog-stereo', { 'device.bus': 'usb', 'device.form_factor': 'headset' }, [['analog-output', 'Analog']]), 'earphones'],
+    ['a Bluetooth headset', pactlSink(80, 'bluez_output.AA_BB_CC_DD_EE_FF.1', { 'device.bus': 'bluetooth', 'api.bluez5.profile': 'a2dp-sink', 'device.form_factor': 'headset' }, [['headset-output', 'Headset']]), 'earphones'],
+    ['a Bluetooth sink with no port or form factor', pactlSink(81, 'bluez_output.AA_BB_CC_DD_EE_FF.1', { 'device.bus': 'bluetooth' }), 'earphones'],
+    ['a Bluetooth speaker', pactlSink(82, 'bluez_output.11_22_33_44_55_66.1', { 'device.bus': 'bluetooth', 'device.form_factor': 'speaker' }, [['speaker-output', 'Speaker']]), 'speakers'],
+    ['an HDMI monitor', pactlSink(99, 'alsa_output.pci-0000_01_00.1.hdmi-stereo', { 'device.bus': 'pci' }, [['hdmi-output-0', 'HDMI']]), 'speakers'],
+    ['an unknown virtual sink', pactlSink(5, 'some_virtual_sink', { 'node.virtual': 'true' }), 'speakers'],
+    ['no sink at all', undefined, 'speakers'],
+  ];
+  for (const [what, sink, kind] of cases) assert.equal(outputKind(sink), kind, what);
+});
+
+test('the output behind an echo-cancel sink is the sink its playback stream goes to', () => {
+  const group = 'echo-cancel-3296-29';
+  const hardware = (active) => pactlSink(63, 'alsa_output.pci.HiFi__hw_sofhdadsp__sink', SOF, SOF_PORTS, active);
+  const ec = pactlSink(39, 'june_ec_sink', { 'node.group': group, 'node.virtual': 'true' });
+  const stream = (sink) => `Sink Input #40\n\tDriver: PipeWire\n\tSink: ${sink}\n\tProperties:\n\t\tnode.name = "echo-cancel-playback"\n\t\tnode.group = "${group}"\n`;
+  const other = 'Sink Input #41\n\tSink: 99\n\tProperties:\n\t\tnode.name = "firefox"\n';
+  for (const [active, kind] of [['[Out] Headphones', 'earphones'], ['[Out] Speaker', 'speakers']]) {
+    const sinks = [ec, hardware(active), pactlSink(99, 'hdmi', {}, [['hdmi-output-0', 'HDMI']])].join('\n');
+    assert.equal(outputKind(outputSink(sinks, [other, stream(63)].join('\n'), 'june_ec_sink')), kind);
+    assert.equal(outputKind(outputSink(sinks, '', 'alsa_output.pci.HiFi__hw_sofhdadsp__sink')), kind, 'a hardware sink is its own output');
+  }
+  // The playback stream is not linked anywhere: unknown, so the guard stays on.
+  assert.equal(outputSink([ec, hardware('[Out] Headphones')].join('\n'), stream(4294967295), 'june_ec_sink'), undefined);
+});
+
 // Feeds a session with a fake speaker: 2 s of room noise at 0.001, then 3 s of playback at `play` while the mic hears `echo` and, every fourth chunk, the quieter audio the canceller leaves. Returns the session.
-function echoRun(play, echo) {
+function echoRun(play, echo, earphones = false) {
   const rand = lcg(11);
   let playing = 0;
   const session = new Session({ key: 'k', model: 'm', voice: 'v', createTools: () => ({}), speaker: { isSpeaking: false, interrupt() {}, level: () => playing } });
   session.connect = () => {};
+  session.echo.off = earphones;
   for (let i = 0; i < 100; i++) session.micChunk(noiseChunk(0.001, rand));
   playing = play;
   for (let i = 0; i < 150; i++) session.micChunk(i % 4 ? noiseChunk(echo, rand) : noiseChunk(0.0001, rand));
@@ -331,6 +371,13 @@ for (const ratio of [0.05, 0.1, 0.2]) {
 test('speech louder than the guard ratio still opens the gate while the voice plays', () => {
   const session = echoRun(0.1, 0.1 * EchoGuard.RATIO * 1.5);
   assert.ok(session.held.chunks.length > 0);
+});
+
+test('with earphones, speech far below the guard ratio still opens the gate while the voice plays', () => {
+  // Measured: your voice reaches june_ec_source at about -41 dBFS while the voice plays at about -17 dBFS, a sixteenth of its level.
+  const quiet = 0.1 * EchoGuard.RATIO / 4;
+  assert.equal(echoRun(0.1, quiet).held.chunks.length, 0, 'with speakers it counts as echo');
+  assert.ok(echoRun(0.1, quiet, true).held.chunks.length > 0, 'with earphones it is speech');
 });
 
 test('the echo reference fades after playback stops instead of dropping at once', () => {
